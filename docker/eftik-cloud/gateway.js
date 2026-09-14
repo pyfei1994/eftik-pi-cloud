@@ -20,6 +20,7 @@ const skillsPath = process.env.GW_SKILLS_PATH || "/home/node/.pi/eftik-skills.js
 const tasksPath = process.env.GW_TASKS_PATH || "/home/node/.pi/eftik-tasks.json";
 const pluginsPath = process.env.GW_PLUGINS_PATH || "/home/node/.pi/eftik-plugins.json";
 const execFileAsync = promisify(execFile);
+const { GW_TOKEN: _pluginGatewayToken, MODEL_PROXY_UPSTREAM_API_KEY: _pluginModelKey, ...pluginInstallEnv } = process.env;
 const maxDownloadBytes = Math.max(1, Number(process.env.GW_MAX_DOWNLOAD_MB) || 200) * 1024 * 1024;
 const maxChatImages = 4;
 const maxImageBase64Bytes = 7 * 1024 * 1024;
@@ -78,11 +79,15 @@ function loadTasks() { try { return JSON.parse(fs.readFileSync(tasksPath, "utf8"
 function saveTasks(tasks) { fs.mkdirSync(path.dirname(tasksPath), { recursive: true }); fs.writeFileSync(tasksPath, JSON.stringify({ tasks }), { mode: 0o600 }); }
 function loadPlugins() { try { return JSON.parse(fs.readFileSync(pluginsPath, "utf8")).plugins || []; } catch (error) { return []; } }
 function savePlugins(plugins) { fs.mkdirSync(path.dirname(pluginsPath), { recursive: true }); fs.writeFileSync(pluginsPath, JSON.stringify({ plugins }), { mode: 0o600 }); }
-function platformPlugin(id) {
-  try {
-    const list = JSON.parse(process.env.GW_PLATFORM_PLUGIN_MANIFEST || "[]");
-    return Array.isArray(list) ? list.find(item => item && item.id === id && typeof item.spec === "string" && item.spec.length > 0) : undefined;
-  } catch { return undefined; }
+function verifiedPlatformPlugin(input) {
+  if (!input || typeof input.id !== "string" || typeof input.name !== "string" || typeof input.spec !== "string" || typeof input.signature !== "string") return undefined;
+  if (!/^[\w-]{1,64}$/.test(input.id) || !input.name.trim() || input.name.length > 100 || !input.spec.trim() || input.spec.length > 240) return undefined;
+  const payload = `${input.id}\0${input.name}\0${input.spec}`;
+  const expected = crypto.createHmac("sha256", process.env.GW_TOKEN || "").update(payload).digest("hex");
+  const actualBuffer = Buffer.from(input.signature, "utf8");
+  const expectedBuffer = Buffer.from(expected, "utf8");
+  if (actualBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(actualBuffer, expectedBuffer)) return undefined;
+  return { id: input.id, name: input.name.trim(), spec: input.spec.trim() };
 }
 function recoverInterruptedTasks() {
   const tasks = loadTasks(); let changed = false;
@@ -492,27 +497,27 @@ const handleRequest = async (request, response) => {
     } catch (error) { return send(response, 400, { error: error.message }); }
   }
   if (request.method === "DELETE" && url.pathname === "/settings") { saveSettings({}); return send(response, 200, {}); }
-  // 仅接受中台创建容器时写入的审核清单中的 ID；请求体没有、也不能携带安装源。
+  // 目录由中台实时校验；运行时只接受使用本工作台 GW_TOKEN 签名的完整条目。
   if (request.method === "GET" && url.pathname === "/plugins") return send(response, 200, { plugins: loadPlugins().map(({ spec, ...item }) => item) });
   if (request.method === "POST" && url.pathname === "/plugins/install") {
     try {
-      const input = await readBody(request); const approved = platformPlugin(input.id);
-      if (!approved) return send(response, 403, { error: "插件不在平台审核清单中" });
+      const input = await readBody(request); const approved = verifiedPlatformPlugin(input);
+      if (!approved) return send(response, 403, { error: "插件安装授权无效" });
       if (active) return send(response, 409, { error: "当前有任务执行中，请稍后操作" });
       const plugins = loadPlugins(); if (plugins.some(item => item.id === approved.id)) return send(response, 200, { ok: true, installed: true });
-      await execFileAsync("pi", ["install", approved.spec], { cwd: process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", timeout: 120000, maxBuffer: 1024 * 1024 });
+      await execFileAsync("pi", ["install", approved.spec], { cwd: process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", env: pluginInstallEnv, timeout: 120000, maxBuffer: 1024 * 1024 });
       plugins.push({ id: approved.id, name: approved.name || approved.id, spec: approved.spec, installedAt: Date.now() }); savePlugins(plugins);
       return send(response, 200, { ok: true, installed: true });
     } catch (error) { return send(response, 400, { error: `插件安装失败：${String(error.stderr || error.message).slice(0, 400)}` }); }
   }
   if (request.method === "POST" && url.pathname === "/plugins/remove") {
     try {
-      const input = await readBody(request); const approved = platformPlugin(input.id);
-      if (!approved) return send(response, 403, { error: "插件不在平台审核清单中" });
+      const input = await readBody(request); const approved = verifiedPlatformPlugin(input);
+      if (!approved) return send(response, 403, { error: "插件卸载授权无效" });
       if (active) return send(response, 409, { error: "当前有任务执行中，请稍后操作" });
       const plugins = loadPlugins(); const plugin = plugins.find(item => item.id === approved.id);
       if (!plugin) return send(response, 200, { ok: true, noop: true });
-      await execFileAsync("pi", ["remove", plugin.spec], { cwd: process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", timeout: 120000, maxBuffer: 1024 * 1024 });
+      await execFileAsync("pi", ["remove", plugin.spec], { cwd: process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", env: pluginInstallEnv, timeout: 120000, maxBuffer: 1024 * 1024 });
       savePlugins(plugins.filter(item => item.id !== approved.id)); return send(response, 200, { ok: true });
     } catch (error) { return send(response, 400, { error: `插件卸载失败：${String(error.stderr || error.message).slice(0, 400)}` }); }
   }
