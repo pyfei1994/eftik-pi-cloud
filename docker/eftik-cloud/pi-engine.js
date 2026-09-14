@@ -51,6 +51,12 @@ function createPiEngine({ onEvent = () => {}, onExit = () => {} } = {}) {
       }
     });
     child.stderr.on("data", (chunk) => process.stderr.write(`[pi] ${chunk}`));
+    // ⚠️ 必须有 error 监听：spawn 失败（ENOENT / 权限不足）会派发 'error' 事件，
+    // 没有监听者时会变成未捕获异常 → **网关进程直接退出** → 容器失败重启。
+    child.once("error", (error) => {
+      rejectPending(error);
+      onExit(error);
+    });
     child.once("exit", (code, signal) => {
       const error = new Error(`PI exited (code=${code}, signal=${signal || "none"})`);
       rejectPending(error);

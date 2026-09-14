@@ -321,8 +321,15 @@ function workspaceUsage(directory) {
   return total;
 }
 
-http.createServer(async (request, response) => {
+const handleRequest = async (request, response) => {
   const url = new URL(request.url, "http://gateway");
+  // ⚠️ 兼容两套路径前缀：DSH 时代是 web-ui.js 在 8080 上把 `/_eftik/api/*` 转发给网关 8090，
+  // 中台调用方用的就是这个前缀。PI 去掉了 web-ui，所以**网关自己必须也认它**，
+  // 否则中台打过来全是 404（实测踩过：容器内 /health 正常，公网 /_eftik/api/health 404）。
+  // URL 的 pathname 有 setter，直接规范化最省事，下游路由代码全都不用改。
+  if (url.pathname === "/_eftik/api" || url.pathname.startsWith("/_eftik/api/")) {
+    url.pathname = url.pathname.slice("/_eftik/api".length) || "/";
+  }
   if (!validToken(request)) return send(response, 401, { error: "invalid gateway token" });
   if (request.method === "GET" && url.pathname === "/health") {
     response.writeHead(engine.ready() ? 200 : 503, { "Content-Type": "application/json" });
@@ -572,6 +579,26 @@ http.createServer(async (request, response) => {
     } catch (error) { return send(response, 500, { error: error.message }); }
   }
   send(response, 404, { error: "not found" });
-}).listen(port, "0.0.0.0", () => console.log(`[pi-gw] listening on ${port}`));
+};
+
+// 监听 8090（本项目的约定端口）。
+http.createServer(handleRequest).listen(port, "0.0.0.0",
+  () => console.log(`[pi-gw] listening on ${port}`));
+
+/**
+ * ⚠️ 同时监听 8080：**Sealos 的 Service/Ingress 是按 8080 建的**（历史原因 ——
+ * DSH 那版把 WebUI 放在 8080，平台的 Service 名就叫 `...-8080-...-service`）。
+ * PI 镜像按产品决定去掉了 WebUI 那一层，于是 Service 把流量转到 8080 时容器里没人监听
+ * → 上游永远不健康 → 公网恒定 503（实测：容器内 curl 8090 返回 401 完全正常，
+ * 但外部 503，pod ready=true 且 0 重启）。这是「本地跑通、生产不通」的真正原因。
+ *
+ * 因此这里多绑一个 8080：平台侧零改动，新老工作台口径一致。
+ * 设 GW_LEGACY_PORT=0 可关闭（若将来 Service 改成 8090）。
+ */
+const legacyPort = Number(process.env.GW_LEGACY_PORT ?? 8080);
+if (legacyPort && legacyPort !== port) {
+  http.createServer(handleRequest).listen(legacyPort, "0.0.0.0",
+    () => console.log(`[pi-gw] also listening on ${legacyPort} (Sealos Service 端口)`));
+}
 
 process.on("SIGTERM", () => engine.stop());
