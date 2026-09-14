@@ -237,10 +237,19 @@ function startJob(message, sessionId, images, scheduledTaskId) {
       else if (sessionPaths.size) await engine.newSession();
       if (!sessionPaths.has(sessionId)) { const state = await engine.state(); sessionPaths.set(sessionId, state.sessionFile); saveSessionPaths(); }
       const settings = loadSettings();
-      if (settings.provider && settings.model) await engine.setModel(settings.provider, settings.model);
+      // 模型由**中台统一配**（端上不暴露模型入口）。带图片的轮次必须走视觉模型，
+      // 否则每次发图都会失败，而用户没有任何自救手段。
+      const provider = settings.provider || "deepseek-official";
+      const wanted = (images && images.length && settings.modelVision) ? settings.modelVision : settings.model;
+      if (wanted) await engine.setModel(provider, wanted);
       if (settings.reasoning) await engine.setThinking(settings.reasoning);
+      // system preamble（中台统一配置、下发到这里）：与 DSH 的 buildSystemPreamble 同一套路，
+      // 作为上下文前缀随本轮一起发。没配就不加，避免污染普通对话。
+      const preamble = typeof settings.systemPreamble === "string" ? settings.systemPreamble.trim() : "";
+      const outgoing = preamble ? `${preamble}\n\n${message}` : message;
+      console.log(`[pi-gw] turn model=${wanted || "(default)"}${images && images.length ? " (vision)" : ""} preamble=${preamble ? preamble.length + "字" : "无"}`);
       if (job.sessionId) appendSessionMessage(job.sessionId, "user", message);
-      await engine.prompt(message, images);
+      await engine.prompt(outgoing, images);
       await job.completion;
     } catch (error) { finish(job, "failed", classifyError(error), error.message); }
   });
@@ -451,7 +460,14 @@ const handleRequest = async (request, response) => {
     try {
       const patch = await readBody(request);
       const settings = { ...loadSettings() };
-      for (const key of ["provider", "model", "reasoning"]) if (typeof patch[key] === "string") settings[key] = patch[key];
+      // 这些键由**中台统一下发**（工作台管理里配），端用户界面不暴露：
+      //   provider/model      默认文本模型
+      //   modelVision         视觉模型（带图片的轮次自动用它，见 startJob）
+      //   reasoning           思考强度
+      //   systemPreamble      全局人设与输出纪律，随每轮 prompt 前置
+      for (const key of ["provider", "model", "modelVision", "reasoning", "systemPreamble"]) {
+        if (typeof patch[key] === "string") settings[key] = patch[key];
+      }
       saveSettings(settings);
       return send(response, 200, settings);
     } catch (error) { return send(response, 400, { error: error.message }); }
