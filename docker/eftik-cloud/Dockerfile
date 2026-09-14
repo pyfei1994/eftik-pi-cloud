@@ -8,7 +8,7 @@ RUN apt-get update \
     && npm install -g @earendil-works/pi-coding-agent@${PI_VERSION} \
     && pi --version
 
-COPY gateway.js pi-engine.js pi-permission-gate.ts entrypoint.sh /opt/gw/
+COPY gateway.js pi-engine.js entrypoint.sh /opt/gw/
 RUN chmod 0755 /opt/gw/entrypoint.sh \
     && mkdir -p /home/node/.pi/agent /home/node/.pi/sessions /workspace \
     && chown -R node:node /home/node /workspace

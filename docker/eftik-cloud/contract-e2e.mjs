@@ -183,25 +183,22 @@ const GW_EVENTS = ["answer", "thinking", "thinking_done", "log", "interaction", 
     check("已产出正文被保留", String(after.body.reply || "").length > 0, `len=${String(after.body.reply || "").length}`);
     console.log(`  取消后: ${J({ status: after.body.status, error_code: after.body.error_code, replyLen: String(after.body.reply || "").length })}`);
 
-    /* ---------- 8. 审批往返 ---------- */
-    console.log("\n[8] 审批往返（越界写入 → interaction → 放行）");
-    const c5 = await api("POST", "/chat", { message: "用 shell 工具在 /etc/eftik-contract.txt 创建文件并写入 hello" });
-    let got = null;
-    const ev5 = await sse(c5.body.task_id, async (ev, d) => {
-      if (ev !== "interaction" || got) return;
-      got = d;
-      const kind = d.kind || (d.request && d.request.method) || "";
-      console.log(`  收到 interaction: id=${d.id} kind=${kind}`);
-      const ans = await api("POST", `/task/${c5.body.task_id}/interaction`, { id: d.id, confirmed: true });
-      console.log(`  回答案 → ${J(ans.body)}`);
+    /* ---------- 8. 工作区外操作：遵循 PI 哲学（无权限门，容器即边界） ---------- */
+    console.log("\n[8] 工作区外操作（无权限门，容器即边界）");
+    // 用 /tmp（node 用户可写）而不是 /etc（root 所有，会因 OS 权限失败而混淆结论）
+    const outsidePath = `/tmp/eftik-contract-${crypto.randomUUID()}.txt`;
+    const c5 = await api("POST", "/chat", { message: `用 shell 工具把 hello 写入 ${outsidePath}，然后告诉我结果` });
+    let sawInteraction = 0, sawBash = 0;
+    const ev5 = await sse(c5.body.task_id, (ev, d) => {
+      if (ev === "interaction") sawInteraction++;
+      if (ev === "log" && /bash|shell/i.test(JSON.stringify(d))) sawBash++;
     }, 240000);
-    check("收到 interaction 事件", !!got, "未收到（越界写入未被拦截？）");
-    if (got) {
-      check("interaction 带 id", !!got.id, J(got));
-      check("interaction 带 kind/type", !!(got.kind || got.type || (got.request && got.request.method)), J(Object.keys(got)));
-    }
     const done5 = ev5.find((e) => e.event === "done");
-    check("审批后回合收尾", done5 && ["done", "failed"].includes(done5.data.status), J(done5 && done5.data.status));
+    check("未弹出任何审批 interaction（pi 哲学：无权限门）", sawInteraction === 0, `interaction=${sawInteraction}`);
+    check("回合正常收尾", done5 && ["done", "failed"].includes(done5.data.status), J(done5 && done5.data.status));
+    check("确实调用了 shell 工具", sawBash > 0, `log匹配=${sawBash}`);
+    console.log(`  目标文件（容器内验证）: ${outsidePath}`);
+    console.log(`  outside_path=${outsidePath}`);
   }
 
   /* ---------- 9. 设置可选项 ---------- */
