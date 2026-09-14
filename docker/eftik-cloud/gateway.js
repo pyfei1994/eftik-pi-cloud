@@ -4,6 +4,8 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
+const dns = require("node:dns").promises;
+const net = require("node:net");
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
 const { createPiEngine } = require("./pi-engine");
@@ -22,6 +24,7 @@ const pluginsPath = process.env.GW_PLUGINS_PATH || "/home/node/.pi/eftik-plugins
 const execFileAsync = promisify(execFile);
 const { GW_TOKEN: _pluginGatewayToken, MODEL_PROXY_UPSTREAM_API_KEY: _pluginModelKey, ...pluginInstallEnv } = process.env;
 const maxDownloadBytes = Math.max(1, Number(process.env.GW_MAX_DOWNLOAD_MB) || 200) * 1024 * 1024;
+const maxSkillArchiveBytes = Math.max(1, Number(process.env.GW_MAX_SKILL_ARCHIVE_MB) || 10) * 1024 * 1024;
 const maxChatImages = 4;
 const maxImageBase64Bytes = 7 * 1024 * 1024;
 const jobRetentionMs = Math.max(1, Number(process.env.GW_JOB_RETENTION_HOURS) || 24) * 60 * 60 * 1000;
@@ -70,10 +73,61 @@ function loadSkills() { try { return JSON.parse(fs.readFileSync(skillsPath, "utf
 function saveSkills(skills) { fs.mkdirSync(path.dirname(skillsPath), { recursive: true }); fs.writeFileSync(skillsPath, JSON.stringify({ skills }), { mode: 0o600 }); }
 function skillDirectory(id) { return path.join(process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", "skills", id); }
 function writeSkill(skill) {
+  if (skill.installUrl) return; // 链接包自带 SKILL.md，不能被表单 prompt 覆盖。
   const directory = skillDirectory(skill.id);
   fs.mkdirSync(directory, { recursive: true });
   const content = `---\nname: ${JSON.stringify(skill.name)}\ndescription: ${JSON.stringify(skill.description || skill.name)}\n---\n\n${skill.prompt}\n`;
   fs.writeFileSync(path.join(directory, "SKILL.md"), content, { mode: 0o600 });
+}
+function isPrivateAddress(address) {
+  if (net.isIPv4(address)) {
+    const [a, b] = address.split(".").map(Number);
+    return a === 10 || a === 127 || a === 0 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  }
+  const v = String(address).toLowerCase();
+  return v === "::1" || v === "::" || v.startsWith("fc") || v.startsWith("fd") || v.startsWith("fe80:");
+}
+async function assertSafeSkillUrl(value) {
+  const url = new URL(String(value || ""));
+  if (url.protocol !== "https:" || url.username || url.password || url.port) throw new Error("技能包链接必须是公开 HTTPS 地址");
+  const addresses = await dns.lookup(url.hostname, { all: true });
+  if (!addresses.length || addresses.some(item => isPrivateAddress(item.address))) throw new Error("技能包链接不能指向内网地址");
+  return url;
+}
+async function downloadSkillArchive(value, file) {
+  let url = await assertSafeSkillUrl(value);
+  for (let redirects = 0; redirects <= 3; redirects++) {
+    const response = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(30000) });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const next = response.headers.get("location");
+      if (!next || redirects === 3) throw new Error("技能包链接重定向次数过多");
+      url = await assertSafeSkillUrl(new URL(next, url).toString());
+      continue;
+    }
+    if (!response.ok || !response.body) throw new Error(`技能包下载失败（HTTP ${response.status}）`);
+    const declared = Number(response.headers.get("content-length") || 0);
+    if (declared > maxSkillArchiveBytes) throw new Error("技能包超过 10 MB 限制");
+    const chunks = []; let total = 0;
+    for await (const chunk of response.body) {
+      total += chunk.length;
+      if (total > maxSkillArchiveBytes) throw new Error("技能包超过 10 MB 限制");
+      chunks.push(chunk);
+    }
+    fs.writeFileSync(file, Buffer.concat(chunks), { mode: 0o600 });
+    return;
+  }
+}
+async function installSkillPackage(skill, installUrl) {
+  const tmp = path.join("/tmp", `pi-skill-${skill.id}-${crypto.randomUUID()}.zip`);
+  const directory = skillDirectory(skill.id);
+  try {
+    await downloadSkillArchive(installUrl, tmp);
+    await execFileAsync("python3", ["/opt/gw/skill-installer.py", tmp, directory], { timeout: 30000, maxBuffer: 64 * 1024 });
+    const prompt = fs.readFileSync(path.join(directory, "SKILL.md"), "utf8");
+    if (prompt.length > 100 * 1024) throw new Error("SKILL.md 超过 100 KB 限制");
+    skill.installUrl = installUrl;
+    skill.prompt = prompt;
+  } finally { try { fs.unlinkSync(tmp); } catch {} }
 }
 function loadTasks() { try { return JSON.parse(fs.readFileSync(tasksPath, "utf8")).tasks || []; } catch (error) { return []; } }
 function saveTasks(tasks) { fs.mkdirSync(path.dirname(tasksPath), { recursive: true }); fs.writeFileSync(tasksPath, JSON.stringify({ tasks }), { mode: 0o600 }); }
@@ -552,9 +606,12 @@ const handleRequest = async (request, response) => {
   if (request.method === "POST" && url.pathname === "/skills") {
     try {
       const input = await readBody(request);
-      if (typeof input.name !== "string" || typeof input.prompt !== "string" || !input.name.trim() || !input.prompt.trim()) return send(response, 400, { error: "name and prompt are required" });
-      const skill = { id: crypto.randomUUID(), name: input.name.trim(), icon: typeof input.icon === "string" ? input.icon.slice(0, 32) : "", description: typeof input.description === "string" ? input.description.trim() : "", prompt: input.prompt.trim(), enabled: input.enabled !== false, createdAt: Date.now(), updatedAt: Date.now() };
-      const skills = loadSkills(); skills.unshift(skill); saveSkills(skills); writeSkill(skill);
+      if (typeof input.name !== "string" || !input.name.trim()) return send(response, 400, { error: "技能名称必填" });
+      const installUrl = typeof input.installUrl === "string" ? input.installUrl.trim() : "";
+      if (!installUrl && (typeof input.prompt !== "string" || !input.prompt.trim())) return send(response, 400, { error: "执行指令必填" });
+      const skill = { id: crypto.randomUUID(), name: input.name.trim(), icon: typeof input.icon === "string" ? input.icon.slice(0, 32) : "", description: typeof input.description === "string" ? input.description.trim() : "", prompt: installUrl ? "" : input.prompt.trim(), enabled: input.enabled !== false, createdAt: Date.now(), updatedAt: Date.now() };
+      if (installUrl) await installSkillPackage(skill, installUrl); else writeSkill(skill);
+      const skills = loadSkills(); skills.unshift(skill); saveSkills(skills);
       return send(response, 200, skill);
     } catch (error) { return send(response, 400, { error: error.message }); }
   }
@@ -564,11 +621,16 @@ const handleRequest = async (request, response) => {
       const input = await readBody(request); const skills = loadSkills(); const skill = skills.find((item) => item.id === skillMatch[1]);
       if (!skill) return send(response, 404, { error: "skill not found" });
       if (typeof input.name === "string") { if (!input.name.trim()) return send(response, 400, { error: "name must not be empty" }); skill.name = input.name.trim(); }
-      if (typeof input.prompt === "string") { if (!input.prompt.trim()) return send(response, 400, { error: "prompt must not be empty" }); skill.prompt = input.prompt.trim(); }
+      const installUrl = typeof input.installUrl === "string" ? input.installUrl.trim() : "";
+      if (installUrl) await installSkillPackage(skill, installUrl);
+      else if (typeof input.prompt === "string") {
+        if (!input.prompt.trim()) return send(response, 400, { error: "prompt must not be empty" });
+        delete skill.installUrl; skill.prompt = input.prompt.trim(); writeSkill(skill);
+      }
       if (typeof input.icon === "string") skill.icon = input.icon.slice(0, 32);
       if (typeof input.description === "string") skill.description = input.description.trim();
       if (typeof input.enabled === "boolean") skill.enabled = input.enabled;
-      skill.updatedAt = Date.now(); saveSkills(skills); writeSkill(skill); return send(response, 200, skill);
+      skill.updatedAt = Date.now(); saveSkills(skills); return send(response, 200, skill);
     } catch (error) { return send(response, 400, { error: error.message }); }
   }
   if (skillMatch && request.method === "DELETE") {
