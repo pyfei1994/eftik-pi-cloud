@@ -103,10 +103,25 @@ function createPiEngine({ onEvent = () => {}, onExit = () => {} } = {}) {
     switchSession: (sessionPath) => command({ type: "switch_session", sessionPath }),
     sessionStats: () => command({ type: "get_session_stats" }),
     respondInteraction: (id, response) => write({ type: "extension_ui_response", id, ...response }),
+    // 插件变更后需要重启 PI 才会载入扩展。PI 偶发不会响应 SIGTERM；此前这里会
+    // 无限等待，导致「插件已装入磁盘，但 HTTP 请求一直 loading、没有结果」。
     restart: () => new Promise((resolve) => {
       if (!child || child.exitCode !== null) { start(); resolve(); return; }
       const current = child;
-      current.once("exit", () => { start(); resolve(); });
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(forceKill);
+        start();
+        resolve();
+      };
+      current.once("exit", finish);
+      const forceKill = setTimeout(() => {
+        if (current.exitCode === null) current.kill("SIGKILL");
+        setTimeout(finish, 300).unref();
+      }, 8000);
+      forceKill.unref();
       current.kill("SIGTERM");
     }),
     stop() { if (child && child.exitCode === null) child.kill("SIGTERM"); },

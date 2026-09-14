@@ -79,6 +79,10 @@ function loadTasks() { try { return JSON.parse(fs.readFileSync(tasksPath, "utf8"
 function saveTasks(tasks) { fs.mkdirSync(path.dirname(tasksPath), { recursive: true }); fs.writeFileSync(tasksPath, JSON.stringify({ tasks }), { mode: 0o600 }); }
 function loadPlugins() { try { return JSON.parse(fs.readFileSync(pluginsPath, "utf8")).plugins || []; } catch (error) { return []; } }
 function savePlugins(plugins) { fs.mkdirSync(path.dirname(pluginsPath), { recursive: true }); fs.writeFileSync(pluginsPath, JSON.stringify({ plugins }), { mode: 0o600 }); }
+function publicPlugin(item) {
+  const { spec, ...safe } = item;
+  return { ...safe, status: item.status || "installed", error: item.error || "" };
+}
 function verifiedPlatformPlugin(input) {
   if (!input || typeof input.id !== "string" || typeof input.name !== "string" || typeof input.spec !== "string" || typeof input.signature !== "string") return undefined;
   if (!/^[\w-]{1,64}$/.test(input.id) || !input.name.trim() || input.name.length > 100 || !input.spec.trim() || input.spec.length > 240) return undefined;
@@ -498,17 +502,35 @@ const handleRequest = async (request, response) => {
   }
   if (request.method === "DELETE" && url.pathname === "/settings") { saveSettings({}); return send(response, 200, {}); }
   // 目录由中台实时校验；运行时只接受使用本工作台 GW_TOKEN 签名的完整条目。
-  if (request.method === "GET" && url.pathname === "/plugins") return send(response, 200, { plugins: loadPlugins().map(({ spec, ...item }) => item) });
+  if (request.method === "GET" && url.pathname === "/plugins") return send(response, 200, { plugins: loadPlugins().map(publicPlugin) });
   if (request.method === "POST" && url.pathname === "/plugins/install") {
     try {
       const input = await readBody(request); const approved = verifiedPlatformPlugin(input);
       if (!approved) return send(response, 403, { error: "插件安装授权无效" });
       if (active) return send(response, 409, { error: "当前有任务执行中，请稍后操作" });
-      const plugins = loadPlugins(); if (plugins.some(item => item.id === approved.id)) return send(response, 200, { ok: true, installed: true });
-      await execFileAsync("pi", ["install", approved.spec], { cwd: process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", env: pluginInstallEnv, timeout: 120000, maxBuffer: 1024 * 1024 });
-      plugins.push({ id: approved.id, name: approved.name || approved.id, spec: approved.spec, installedAt: Date.now() }); savePlugins(plugins);
-      await engine.restart(); lastError = "";
-      return send(response, 200, { ok: true, installed: true });
+      const plugins = loadPlugins(); const existing = plugins.find(item => item.id === approved.id);
+      if (existing && (existing.status || "installed") === "installed") return send(response, 200, { ok: true, status: "installed" });
+      if (existing && existing.status === "installing") return send(response, 202, { ok: true, status: "installing" });
+      const record = { id: approved.id, name: approved.name || approved.id, spec: approved.spec, status: "installing", startedAt: Date.now(), error: "" };
+      if (existing) Object.assign(existing, record); else plugins.push(record);
+      savePlugins(plugins);
+      // 下载 npm 包与重启内核都可能持续几十秒；先返回受理结果，端上轮询最终状态，
+      // 避免整页被 wx.showLoading 锁死。
+      void (async () => {
+        try {
+          await execFileAsync("pi", ["install", approved.spec], { cwd: process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", env: pluginInstallEnv, timeout: 120000, maxBuffer: 1024 * 1024 });
+          // 只有新 PI 进程已启动后才对端上标记 installed，避免用户刚看到成功就去对话，
+          // 但扩展尚未被新内核加载的竞态。
+          await engine.restart(); lastError = "";
+          const latest = loadPlugins(); const saved = latest.find(item => item.id === approved.id);
+          if (saved) { saved.status = "installed"; saved.installedAt = Date.now(); saved.error = ""; delete saved.startedAt; savePlugins(latest); }
+        } catch (error) {
+          const latest = loadPlugins(); const saved = latest.find(item => item.id === approved.id);
+          if (saved) { saved.status = "failed"; saved.error = String(error.stderr || error.message || "安装失败").slice(0, 400); savePlugins(latest); }
+          console.warn(`[pi-gw] plugin install ${approved.id} failed: ${String(error.message || error)}`);
+        }
+      })();
+      return send(response, 202, { ok: true, status: "installing" });
     } catch (error) { return send(response, 400, { error: `插件安装失败：${String(error.stderr || error.message).slice(0, 400)}` }); }
   }
   if (request.method === "POST" && url.pathname === "/plugins/remove") {
