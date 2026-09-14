@@ -103,6 +103,12 @@ function createPiEngine({ onEvent = () => {}, onExit = () => {} } = {}) {
     switchSession: (sessionPath) => command({ type: "switch_session", sessionPath }),
     sessionStats: () => command({ type: "get_session_stats" }),
     respondInteraction: (id, response) => write({ type: "extension_ui_response", id, ...response }),
+    restart: () => new Promise((resolve) => {
+      if (!child || child.exitCode !== null) { start(); resolve(); return; }
+      const current = child;
+      current.once("exit", () => { start(); resolve(); });
+      current.kill("SIGTERM");
+    }),
     stop() { if (child && child.exitCode === null) child.kill("SIGTERM"); },
   };
 }

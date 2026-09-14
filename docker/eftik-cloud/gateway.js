@@ -507,6 +507,7 @@ const handleRequest = async (request, response) => {
       const plugins = loadPlugins(); if (plugins.some(item => item.id === approved.id)) return send(response, 200, { ok: true, installed: true });
       await execFileAsync("pi", ["install", approved.spec], { cwd: process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", env: pluginInstallEnv, timeout: 120000, maxBuffer: 1024 * 1024 });
       plugins.push({ id: approved.id, name: approved.name || approved.id, spec: approved.spec, installedAt: Date.now() }); savePlugins(plugins);
+      await engine.restart(); lastError = "";
       return send(response, 200, { ok: true, installed: true });
     } catch (error) { return send(response, 400, { error: `插件安装失败：${String(error.stderr || error.message).slice(0, 400)}` }); }
   }
@@ -518,7 +519,7 @@ const handleRequest = async (request, response) => {
       const plugins = loadPlugins(); const plugin = plugins.find(item => item.id === approved.id);
       if (!plugin) return send(response, 200, { ok: true, noop: true });
       await execFileAsync("pi", ["remove", plugin.spec], { cwd: process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", env: pluginInstallEnv, timeout: 120000, maxBuffer: 1024 * 1024 });
-      savePlugins(plugins.filter(item => item.id !== approved.id)); return send(response, 200, { ok: true });
+      savePlugins(plugins.filter(item => item.id !== approved.id)); await engine.restart(); lastError = ""; return send(response, 200, { ok: true });
     } catch (error) { return send(response, 400, { error: `插件卸载失败：${String(error.stderr || error.message).slice(0, 400)}` }); }
   }
   if (request.method === "GET" && url.pathname === "/settings/options") {
