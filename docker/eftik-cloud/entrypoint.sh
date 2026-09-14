@@ -6,4 +6,12 @@
 set -eu
 mkdir -p /home/node/.pi/agent /home/node/.pi/sessions /workspace 2>/dev/null || true
 chown -R node:node /home/node/.pi /workspace 2>/dev/null || true
+node /opt/gw/model-proxy.js &
+proxy_pid=$!
+trap 'kill "$proxy_pid" 2>/dev/null || true; exit 0' INT TERM
+cat > /home/node/.pi/agent/models.json <<'EOF'
+{"providers":{"deepseek":{"baseUrl":"http://127.0.0.1:8787","apiKey":"local-proxy"}}}
+EOF
+chown node:node /home/node/.pi/agent/models.json
+unset MODEL_PROXY_UPSTREAM_API_KEY MODEL_PROXY_UPSTREAM_HOST DEEPSEEK_API_KEY
 exec setpriv --reuid=node --regid=node --clear-groups node /opt/gw/gateway.js

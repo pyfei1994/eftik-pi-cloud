@@ -4,6 +4,8 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
 const { createPiEngine } = require("./pi-engine");
 
 const port = Number(process.env.GW_PORT || 8090);
@@ -16,6 +18,8 @@ const sessionMetadataPath = process.env.GW_SESSION_METADATA_PATH || "/home/node/
 const settingsPath = process.env.GW_SETTINGS_PATH || "/home/node/.pi/eftik-settings.json";
 const skillsPath = process.env.GW_SKILLS_PATH || "/home/node/.pi/eftik-skills.json";
 const tasksPath = process.env.GW_TASKS_PATH || "/home/node/.pi/eftik-tasks.json";
+const pluginsPath = process.env.GW_PLUGINS_PATH || "/home/node/.pi/eftik-plugins.json";
+const execFileAsync = promisify(execFile);
 const maxDownloadBytes = Math.max(1, Number(process.env.GW_MAX_DOWNLOAD_MB) || 200) * 1024 * 1024;
 const maxChatImages = 4;
 const maxImageBase64Bytes = 7 * 1024 * 1024;
@@ -72,6 +76,14 @@ function writeSkill(skill) {
 }
 function loadTasks() { try { return JSON.parse(fs.readFileSync(tasksPath, "utf8")).tasks || []; } catch (error) { return []; } }
 function saveTasks(tasks) { fs.mkdirSync(path.dirname(tasksPath), { recursive: true }); fs.writeFileSync(tasksPath, JSON.stringify({ tasks }), { mode: 0o600 }); }
+function loadPlugins() { try { return JSON.parse(fs.readFileSync(pluginsPath, "utf8")).plugins || []; } catch (error) { return []; } }
+function savePlugins(plugins) { fs.mkdirSync(path.dirname(pluginsPath), { recursive: true }); fs.writeFileSync(pluginsPath, JSON.stringify({ plugins }), { mode: 0o600 }); }
+function platformPlugin(id) {
+  try {
+    const list = JSON.parse(process.env.GW_PLATFORM_PLUGIN_MANIFEST || "[]");
+    return Array.isArray(list) ? list.find(item => item && item.id === id && typeof item.spec === "string" && item.spec.length > 0) : undefined;
+  } catch { return undefined; }
+}
 function recoverInterruptedTasks() {
   const tasks = loadTasks(); let changed = false;
   for (const task of tasks) {
@@ -202,7 +214,12 @@ const engine = createPiEngine({
     } else if (event.type === "message_end") {
       // 权威正文以 message_end 的完整消息为准（流式 delta 只负责实时渲染）：
       // 断线重连、粘包丢帧、retry 之后的正文都能在这里被纠正回来。
+      //
+      // ⚠️ message_end **对用户消息也会触发**。而我们把 systemPreamble 前置在了用户消息上，
+      // 所以不加这道 role 判断的话，用户消息会把真正的回复覆盖掉 ——
+      // 实测症状：回复里原样吐出 preamble 那段话。
       const message = event.message || {};
+      if (message.role && message.role !== "assistant") return;
       const text = Array.isArray(message.content)
         ? message.content.filter((part) => part && part.type === "text").map((part) => part.text || "").join("")
         : (typeof message.content === "string" ? message.content : "");
@@ -239,7 +256,7 @@ function startJob(message, sessionId, images, scheduledTaskId) {
       const settings = loadSettings();
       // 模型由**中台统一配**（端上不暴露模型入口）。带图片的轮次必须走视觉模型，
       // 否则每次发图都会失败，而用户没有任何自救手段。
-      const provider = settings.provider || "deepseek-official";
+      const provider = settings.provider || "deepseek";
       const wanted = (images && images.length && settings.modelVision) ? settings.modelVision : settings.model;
       if (wanted) await engine.setModel(provider, wanted);
       if (settings.reasoning) await engine.setThinking(settings.reasoning);
@@ -448,7 +465,9 @@ const handleRequest = async (request, response) => {
   }
   if (sessionMatch && request.method === "DELETE") {
     const id = sessionMatch[1]; const sessionPath = sessionPaths.get(id);
-    if (!sessionMetadata[id] && !sessionPath) return send(response, 404, { error: "session not found" });
+    // ⚠️ 幂等：内核不认识这个会话（只在数据端留过档、或容器重建后 sessionPaths 已丢）
+    // 也应视为「已删除」返回 200 —— 否则小程序/中台删会话会因为 not found 而整条失败。
+    if (!sessionMetadata[id] && !sessionPath) return send(response, 200, { ok: true, noop: true });
     sessionPaths.delete(id); delete sessionMetadata[id]; saveSessionPaths(); saveSessionMetadata();
     if (sessionPath) {
       try { fs.unlinkSync(sessionPath); } catch (error) { if (error.code !== "ENOENT") throw error; }
@@ -473,6 +492,30 @@ const handleRequest = async (request, response) => {
     } catch (error) { return send(response, 400, { error: error.message }); }
   }
   if (request.method === "DELETE" && url.pathname === "/settings") { saveSettings({}); return send(response, 200, {}); }
+  // 仅接受中台创建容器时写入的审核清单中的 ID；请求体没有、也不能携带安装源。
+  if (request.method === "GET" && url.pathname === "/plugins") return send(response, 200, { plugins: loadPlugins().map(({ spec, ...item }) => item) });
+  if (request.method === "POST" && url.pathname === "/plugins/install") {
+    try {
+      const input = await readBody(request); const approved = platformPlugin(input.id);
+      if (!approved) return send(response, 403, { error: "插件不在平台审核清单中" });
+      if (active) return send(response, 409, { error: "当前有任务执行中，请稍后操作" });
+      const plugins = loadPlugins(); if (plugins.some(item => item.id === approved.id)) return send(response, 200, { ok: true, installed: true });
+      await execFileAsync("pi", ["install", approved.spec], { cwd: process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", timeout: 120000, maxBuffer: 1024 * 1024 });
+      plugins.push({ id: approved.id, name: approved.name || approved.id, spec: approved.spec, installedAt: Date.now() }); savePlugins(plugins);
+      return send(response, 200, { ok: true, installed: true });
+    } catch (error) { return send(response, 400, { error: `插件安装失败：${String(error.stderr || error.message).slice(0, 400)}` }); }
+  }
+  if (request.method === "POST" && url.pathname === "/plugins/remove") {
+    try {
+      const input = await readBody(request); const approved = platformPlugin(input.id);
+      if (!approved) return send(response, 403, { error: "插件不在平台审核清单中" });
+      if (active) return send(response, 409, { error: "当前有任务执行中，请稍后操作" });
+      const plugins = loadPlugins(); const plugin = plugins.find(item => item.id === approved.id);
+      if (!plugin) return send(response, 200, { ok: true, noop: true });
+      await execFileAsync("pi", ["remove", plugin.spec], { cwd: process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", timeout: 120000, maxBuffer: 1024 * 1024 });
+      savePlugins(plugins.filter(item => item.id !== approved.id)); return send(response, 200, { ok: true });
+    } catch (error) { return send(response, 400, { error: `插件卸载失败：${String(error.stderr || error.message).slice(0, 400)}` }); }
+  }
   if (request.method === "GET" && url.pathname === "/settings/options") {
     try { return send(response, 200, { models: await engine.models(), current: loadSettings(), reasoning: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] }); }
     catch (error) { return send(response, 503, { error: error.message }); }
