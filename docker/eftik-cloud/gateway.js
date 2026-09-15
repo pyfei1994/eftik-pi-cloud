@@ -472,6 +472,18 @@ const handleRequest = async (request, response) => {
       return send(response, 200, { path: url.searchParams.get("path"), size: bytes.length });
     } catch (error) { return send(response, error.message === "file too large" ? 413 : 400, { error: error.message }); }
   }
+  if (request.method === "POST" && url.pathname === "/files/mkdir") {
+    try {
+      const input = await readBody(request);
+      if (!input || typeof input.path !== "string" || !input.path.trim()) return send(response, 400, { error: "path is required" });
+      const root = fs.realpathSync.native(path.resolve(process.env.GW_WORKDIR || "/workspace"));
+      const target = workspacePath(input.path);
+      if (target === root) return send(response, 400, { error: "cannot create workspace root" });
+      if (fs.existsSync(target)) return send(response, 409, { error: "path already exists" });
+      fs.mkdirSync(target, { recursive: false, mode: 0o700 });
+      return send(response, 200, { ok: true, path: input.path });
+    } catch (error) { return send(response, error.code === "EEXIST" ? 409 : 400, { error: error.message }); }
+  }
   if (request.method === "GET" && url.pathname === "/files/download") {
     try {
       const target = workspacePath(url.searchParams.get("path"));
