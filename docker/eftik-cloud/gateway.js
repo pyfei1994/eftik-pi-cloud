@@ -27,6 +27,7 @@ const maxDownloadBytes = Math.max(1, Number(process.env.GW_MAX_DOWNLOAD_MB) || 2
 const maxSkillArchiveBytes = Math.max(1, Number(process.env.GW_MAX_SKILL_ARCHIVE_MB) || 10) * 1024 * 1024;
 const maxChatImages = 4;
 const maxImageBase64Bytes = 7 * 1024 * 1024;
+const maxTaskRuns = 100;
 const jobRetentionMs = Math.max(1, Number(process.env.GW_JOB_RETENTION_HOURS) || 24) * 60 * 60 * 1000;
 const supportedImageTypes = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 const sessionPaths = new Map();
@@ -131,6 +132,7 @@ async function installSkillPackage(skill, installUrl) {
 }
 function loadTasks() { try { return JSON.parse(fs.readFileSync(tasksPath, "utf8")).tasks || []; } catch (error) { return []; } }
 function saveTasks(tasks) { fs.mkdirSync(path.dirname(tasksPath), { recursive: true }); fs.writeFileSync(tasksPath, JSON.stringify({ tasks }), { mode: 0o600 }); }
+function trimTaskRuns(task) { task.runs = (task.runs || []).sort((left, right) => (right.finishedAt || right.at || 0) - (left.finishedAt || left.at || 0)).slice(0, maxTaskRuns); }
 function loadPlugins() { try { return JSON.parse(fs.readFileSync(pluginsPath, "utf8")).plugins || []; } catch (error) { return []; } }
 function savePlugins(plugins) { fs.mkdirSync(path.dirname(pluginsPath), { recursive: true }); fs.writeFileSync(pluginsPath, JSON.stringify({ plugins }), { mode: 0o600 }); }
 function publicPlugin(item) {
@@ -205,9 +207,9 @@ function finish(job, status, errorCode = "", error = "") {
       task.lastStatus = status; task.lastError = error; task.lastRunAt = Date.now();
       task.runs ||= [];
       const run = task.runs.find((item) => item.id === job.id);
-      if (run) { run.status = status; run.error = error; run.reply = job.reply.slice(0, 500); }
-      else task.runs.unshift({ id: job.id, at: job.createdAt, status, error, reply: job.reply.slice(0, 500) });
-      task.runs = task.runs.slice(0, 20);
+      if (run) { run.status = status; run.error = error; run.reply = job.reply; run.finishedAt = job.finishedAt; }
+      else task.runs.unshift({ id: job.id, at: job.createdAt, finishedAt: job.finishedAt, status, error, reply: job.reply });
+      trimTaskRuns(task);
       saveTasks(tasks);
     }
   }
@@ -354,7 +356,7 @@ function runDueTasks() {
   if (!task) return;
   task.lastRunAt = Date.now(); task.lastStatus = "queued";
   const job = startJob(task.prompt, `scheduled-${task.id}`, undefined, task.id);
-  task.runs = [{ id: job.id, at: task.lastRunAt, status: "queued" }, ...(task.runs || [])].slice(0, 20);
+  task.runs = [{ id: job.id, at: task.lastRunAt, status: "queued" }, ...(task.runs || [])]; trimTaskRuns(task);
   saveTasks(tasks);
 }
 
@@ -456,11 +458,15 @@ const handleRequest = async (request, response) => {
   }
   if (request.method === "GET" && url.pathname === "/storage") {
     try {
-      const stat = fs.statfsSync(process.env.GW_WORKDIR || "/workspace");
+      const requestedPath = url.searchParams.get("path") || "/workspace";
+      const directory = requestedPath === "/workspace" ? (process.env.GW_WORKDIR || "/workspace")
+        : requestedPath === "/home/node/.pi" ? "/home/node/.pi" : undefined;
+      if (!directory) return send(response, 400, { error: "unsupported storage path" });
+      const stat = fs.statfsSync(directory);
       const totalBytes = Number(stat.blocks) * Number(stat.bsize);
       const freeBytes = Number(stat.bavail) * Number(stat.bsize);
-      const usedBytes = workspaceUsage(process.env.GW_WORKDIR || "/workspace");
-      return send(response, 200, { path: "/workspace", usedBytes, totalBytes, freeBytes, usedPct: totalBytes ? Math.round(usedBytes * 10000 / totalBytes) / 100 : 0 });
+      const usedBytes = workspaceUsage(directory);
+      return send(response, 200, { path: requestedPath, usedBytes, totalBytes, freeBytes, usedPct: totalBytes ? Math.round(usedBytes * 10000 / totalBytes) / 100 : 0 });
     } catch (error) { return send(response, 500, { error: error.message }); }
   }
   if (request.method === "POST" && url.pathname === "/files/upload") {
@@ -686,14 +692,25 @@ const handleRequest = async (request, response) => {
     if (!task) return send(response, 404, { error: "task not found" });
     try {
       const job = await startJob(task.prompt, `scheduled-${task.id}`, undefined, task.id);
-      task.lastRunAt = Date.now(); task.lastStatus = "queued"; task.runs.unshift({ id: job.id, at: task.lastRunAt, status: "queued" }); saveTasks(loadTasks().map((item) => item.id === task.id ? task : item));
+      task.lastRunAt = Date.now(); task.lastStatus = "queued"; task.runs.unshift({ id: job.id, at: task.lastRunAt, status: "queued" }); trimTaskRuns(task); saveTasks(loadTasks().map((item) => item.id === task.id ? task : item));
       return send(response, 200, { task_id: job.id });
     } catch (error) { return send(response, error.message === "TASK_RUNNING" ? 409 : 500, { error: error.message }); }
   }
   const taskRunsMatch = url.pathname.match(/^\/tasks\/([\w-]+)\/runs$/);
   if (taskRunsMatch && request.method === "GET") {
     const task = loadTasks().find((item) => item.id === taskRunsMatch[1]);
-    return task ? send(response, 200, { taskId: task.id, lastStatus: task.lastStatus || "", lastRunAt: task.lastRunAt || 0, runs: task.runs || [] }) : send(response, 404, { error: "task not found" });
+    if (!task) return send(response, 404, { error: "task not found" });
+    trimTaskRuns(task);
+    const page = Math.max(1, Math.trunc(Number(url.searchParams.get("page")) || 1));
+    const size = Math.min(20, Math.max(1, Math.trunc(Number(url.searchParams.get("size")) || 20)));
+    const total = task.runs.length; const offset = (page - 1) * size;
+    return send(response, 200, { taskId: task.id, lastStatus: task.lastStatus || "", lastRunAt: task.lastRunAt || 0, runs: task.runs.slice(offset, offset + size), total, hasMore: offset + size < total });
+  }
+  const taskRunDetailMatch = url.pathname.match(/^\/tasks\/([\w-]+)\/runs\/([\w-]+)$/);
+  if (taskRunDetailMatch && request.method === "GET") {
+    const task = loadTasks().find((item) => item.id === taskRunDetailMatch[1]);
+    const run = task && (task.runs || []).find((item) => item.id === taskRunDetailMatch[2]);
+    return run ? send(response, 200, run) : send(response, 404, { error: "task run not found" });
   }
   const match = url.pathname.match(/^\/task\/([\w-]+)(?:\/(stream))?$/);
   if (match) {

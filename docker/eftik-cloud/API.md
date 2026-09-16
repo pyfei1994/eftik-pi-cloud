@@ -176,7 +176,7 @@ data: {"text":"增量正文","t":1730000000000}
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/files?path=/` | 列目录；目录优先、同类型按名称排序 |
-| `GET` | `/storage` | 返回工作区 `du` 语义的用量和文件系统容量 |
+| `GET` | `/storage?path=/workspace` | 返回工作区 `du` 语义的用量和文件系统容量；也可统计 `/home/node/.pi` |
 | `POST` | `/files/upload?path=/a.txt` | 原始二进制 body 上传，最大 200 MiB |
 | `GET` | `/files/download?path=/a.txt` | 二进制下载，最大值由 `GW_MAX_DOWNLOAD_MB` 控制，默认 200 MiB |
 | `DELETE` | `/files?path=/a.txt` | 删除普通文件或符号链接 |
@@ -241,7 +241,7 @@ data: {"text":"增量正文","t":1730000000000}
 
 ## 8. 定时任务
 
-网关每 30 秒检查一次到期任务，并追加到与聊天共用的 FIFO。最多保留最近 20 条执行记录。
+网关每 30 秒检查一次到期任务，并追加到与聊天共用的 FIFO。每个任务保留最近 100 条执行记录。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -250,7 +250,8 @@ data: {"text":"增量正文","t":1730000000000}
 | `PUT` | `/tasks/{id}` | 部分更新 |
 | `DELETE` | `/tasks/{id}` | 删除 |
 | `POST` | `/tasks/{id}/run` | 立即追加一次执行，返回 `{task_id}` |
-| `GET` | `/tasks/{id}/runs` | 返回该任务的状态和历史 runs |
+| `GET` | `/tasks/{id}/runs?page=1&size=20` | 返回 `{runs,total,hasMore}`，每页最多 20 条 |
+| `GET` | `/tasks/{id}/runs/{runId}` | 返回单条执行记录（含完整回复或错误） |
 
 `schedule` 形态：
 
