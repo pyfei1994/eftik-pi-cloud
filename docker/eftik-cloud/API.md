@@ -3,7 +3,7 @@
 运行时镜像内的 Node 网关，监听 `8090`，由 KitsuMe/Sealos 调用。PI 本体只通过 JSONL RPC
 与网关通信；业务调用方不直接连接 `pi`。
 
-当前版本：`gateway/pi-p1`，PI `0.85.1`。
+当前版本：`gateway/pi-p2`，PI `0.85.1`。
 
 ## 1. 调用约定
 
@@ -39,7 +39,7 @@ PI RPC 子进程就绪时返回 `200`，未就绪时返回 `503`。
   "ok": true,
   "runtime": "pi",
   "runtimeVersion": "0.85.1",
-  "version": "gateway/pi-p1",
+  "version": "gateway/pi-p2",
   "jobs": 2,
   "engine_ready": true
 }
@@ -117,6 +117,8 @@ data: {"text":"增量正文","t":1730000000000}
 | `interaction` | PI 原始 extension UI 请求 | 等待用户确认/输入 |
 | `interaction_resolved` | `{id,...response}` | 交互已答复 |
 | `done` | 见下方 | 任务终态，随后流关闭 |
+| `: ping <ts>` | — | **心跳注释帧**（不是事件）：流每静默 15s 补一行，避免被中间代理
+按 idle timeout 掐断。客户端按 SSE 规范忽略以 `:` 开头的行即可 |
 
 `done` 数据：
 
@@ -293,6 +295,14 @@ SESSION_LOST, KERNEL_NOT_READY, MODEL_ERROR, CONTAINER_RESTARTED
 | `GW_TASKS_PATH` | `/home/node/.pi/eftik-tasks.json` | 定时任务记录 |
 
 `GW_TOKEN` 与 `GW_ADMIN_TOKEN` 不会传入 PI 子进程；模型进程工作目录固定为 `/workspace`。
+
+### 长任务与心跳
+
+安装技能 / 装依赖 / 跑构建这类工具可能连续几分钟不产生任何事件。**网关每 15s 写一行
+`": ping <ts>"` 注释帧续命**，否则链路上的代理（Sealos 入口 envoy 默认
+`stream_idle_timeout=300s`）会掐掉这条静默连接，调用方只能读到 `closed`。
+调用方解析时按 SSE 规范忽略 `:` 开头的行即可；KitsuMe 后端另有自己的 15s 心跳
+（后端 → 端上一跳同样要过反代）。
 
 ## 11. 已知未支持项
 

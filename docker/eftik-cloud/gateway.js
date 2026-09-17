@@ -243,6 +243,13 @@ function normalizeUsage(raw) {
 const MAX_EVENTS = 200;
 /** /chat 正文长度硬上限（与 DSH 一致）：超限直接 400，不当成模型错误 */
 const MAX_CHAT_CHARS = 200000;
+/**
+ * SSE 心跳间隔。长工具（装技能、装依赖、跑构建）期间内核可能连续几分钟不产生任何事件，
+ * 而中间链路上的代理会按 idle timeout 掐掉这条「静默连接」——Sealos 入口 envoy 的
+ * stream_idle_timeout 默认 300s，中台后端因此报 `工作台流式读取失败: closed`。
+ * 心跳写成 SSE 注释行（以 `:` 开头），不构成事件，客户端解析器直接忽略，只负责续命。
+ */
+const SSE_HEARTBEAT_MS = 15000;
 
 /** 推一条 log 事件（工具可观测；形状必须与 DSH 一致：{t,text}） */
 function pushLog(job, text) {
@@ -425,7 +432,7 @@ const handleRequest = async (request, response) => {
   if (request.method === "GET" && url.pathname === "/health") {
     response.writeHead(engine.ready() ? 200 : 503, { "Content-Type": "application/json" });
     response.end(JSON.stringify({
-      ok: engine.ready(), runtime: "pi", runtimeVersion: "0.85.1", version: "gateway/pi-p1", jobs: jobs.size,
+      ok: engine.ready(), runtime: "pi", runtimeVersion: "0.85.1", version: "gateway/pi-p2", jobs: jobs.size,
       engine_ready: engine.ready(), ...(lastError ? { error: lastError } : {}),
     }));
     return;
@@ -719,7 +726,23 @@ const handleRequest = async (request, response) => {
     if (request.method === "GET" && match[2] === "stream") {
       response.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
       let cursor = 0;
-      const timer = setInterval(() => { while (cursor < job.events.length) { const event = job.events[cursor++]; response.write(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`); } if (job.done) { clearInterval(timer); response.end(); } }, 50);
+      // 每次真正写出事件时刷新 lastWriteAt；静默超过 SSE_HEARTBEAT_MS 就补一行注释心跳，
+      // 避免被中间代理按 idle timeout 断开（见 SSE_HEARTBEAT_MS 注释）。
+      let lastWriteAt = Date.now();
+      const timer = setInterval(() => {
+        let wrote = false;
+        while (cursor < job.events.length) {
+          const event = job.events[cursor++];
+          response.write(`event: ${event.type}\ndata: ${JSON.stringify(event.data)}\n\n`);
+          wrote = true;
+        }
+        if (wrote) { lastWriteAt = Date.now(); return; }
+        if (job.done) { clearInterval(timer); response.end(); return; }
+        if (Date.now() - lastWriteAt >= SSE_HEARTBEAT_MS) {
+          response.write(`: ping ${Date.now()}\n\n`);
+          lastWriteAt = Date.now();
+        }
+      }, 50);
       request.once("close", () => clearInterval(timer)); return;
     }
     if (request.method === "GET") return send(response, 200, {
