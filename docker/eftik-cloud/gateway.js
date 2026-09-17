@@ -13,6 +13,8 @@ const { createPiEngine } = require("./pi-engine");
 const port = Number(process.env.GW_PORT || 8090);
 let lastError = "";
 let active;
+// 上一次「中止任务」的时间。用于甄别「上一轮被中止的收尾事件」（见 onEvent 的竞态说明）
+let lastAbortAt = 0;
 const jobs = new Map();
 let queue = Promise.resolve();
 const sessionMapPath = process.env.GW_PI_SESSION_MAP_PATH || "/home/node/.pi/eftik-sessions.json";
@@ -251,6 +253,13 @@ const MAX_CHAT_CHARS = 200000;
  */
 const SSE_HEARTBEAT_MS = 15000;
 
+/**
+ * 「刚中止过一轮」的保护窗口。PI 会在用户消息开始时发 `message_start`(role=user)，
+ * 网关用它作为「本条 prompt 真的被内核接管」的判据；只有在**这个窗口内**（也就是
+ * 刚刚 DELETE 过任务、上一轮可能还没收尾时）才启用丢弃逻辑，正常对话完全不受影响。
+ */
+const STALE_AFTER_ABORT_MS = 60000;
+
 /** 推一条 log 事件（工具可观测；形状必须与 DSH 一致：{t,text}） */
 function pushLog(job, text) {
   if (!job || job.events.length >= MAX_EVENTS) return;
@@ -272,7 +281,27 @@ jobCleanup.unref();
 const engine = createPiEngine({
   onExit: (error) => { lastError = error.message; if (active) finish(active, "failed", "KERNEL_NOT_READY", error.message); },
   onEvent: (event) => {
+    // ① 「用户消息开始」＝本轮的 prompt 真的被内核接管的信号（见下方 onEvent 开头的竞态说明）
+    if (event.type === "message_start") {
+      if (active && event.message && event.message.role === "user") active.userTurnStarted = true;
+      return;
+    }
     if (!active) return;
+    // ② 本轮还没开始 ⇒ 这些事件属于**上一轮被中止的收尾**，丢弃。
+    //
+    // 这是 /task DELETE 的竞态防护：DELETE 的步骤是 clearQueue → finish(cancelled) → abort()，
+    // 而 PI 的 abort() 内部要 `await waitForIdle()`（等这一轮真的收尾才返回）。finish 之后
+    // active 就被清空，用户紧接着发下的下一条会立刻成为 active —— 上一轮收尾时的
+    // `agent_settled` 会把**新任务**直接判成 done，于是用户看到
+    // 「刚点了停止，再问一句就回『模型本次没有返回内容』且 0 tokens」。
+    // 只在刚中止过的窗口内启用，避免影响正常对话。
+    if (!active.userTurnStarted && Date.now() - lastAbortAt < STALE_AFTER_ABORT_MS) {
+      if (event.type === "agent_settled") {
+        console.log("[pi-gw] 忽略上一轮中止收尾的 agent_settled（本轮 prompt 尚未开始）");
+        return;
+      }
+      if (event.type === "message_update" || event.type === "message_end") return;
+    }
     if (event.type === "message_update") {
       const delta = event.assistantMessageEvent || {};
       if (delta.type === "text_delta") {
@@ -310,7 +339,7 @@ const engine = createPiEngine({
 engine.start();
 
 function startJob(message, sessionId, images, scheduledTaskId) {
-  const job = { id: crypto.randomUUID(), createdAt: Date.now(), status: "queued", reply: "", usage: null, events: [], interactions: new Map(), error: "", errorCode: "", done: false, thinkingSeen: false, thinkingFinished: false, scheduledTaskId, sessionId: scheduledTaskId ? "" : sessionId };
+  const job = { id: crypto.randomUUID(), createdAt: Date.now(), status: "queued", reply: "", usage: null, events: [], interactions: new Map(), error: "", errorCode: "", done: false, thinkingSeen: false, thinkingFinished: false, userTurnStarted: false, scheduledTaskId, sessionId: scheduledTaskId ? "" : sessionId };
   job.completion = new Promise((resolve) => { job.resolveCompletion = resolve; });
   jobs.set(job.id, job);
   void enqueue(async () => {
@@ -752,7 +781,15 @@ const handleRequest = async (request, response) => {
     if (request.method === "DELETE") {
       if (job.status === "queued") { finish(job, "cancelled", "CANCELLED"); return send(response, 200, { ok: true }); }
       if (job === active) {
-        try { await engine.clearQueue(); finish(job, "cancelled", "CANCELLED"); await engine.abort(); return send(response, 200, { ok: true }); } catch (error) { return send(response, 500, { error: error.message }); }
+        try {
+          await engine.clearQueue();
+          // 先记账再 finish：finish 会清空 active，用户下一条随即可能开始，
+          // 这一轮被中止后的收尾事件必须能被识别出来（见 onEvent ② 段）。
+          lastAbortAt = Date.now();
+          finish(job, "cancelled", "CANCELLED");
+          await engine.abort();
+          return send(response, 200, { ok: true });
+        } catch (error) { return send(response, 500, { error: error.message }); }
       }
       return send(response, 409, { error: "task is already finished" });
     }
