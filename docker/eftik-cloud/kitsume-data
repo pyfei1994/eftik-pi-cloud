@@ -6,12 +6,12 @@ kitsume-data —— 查询「我自己的」工作台数据（分身 / 知识库
 只读。没有删除、没有修改、没有上传。
 
 ============================ 安全边界（改之前必读） ============================
-1. 身份从哪来：容器 env 里的 $GW_TOKEN。它只是本工作台的网关令牌，
-   中台拿它反查出「这台工作台属于哪个用户」，所以**即使令牌泄露，
-   能读到的也只有这个用户自己的数据**。
+1. 身份从哪来：容器 env 里的 $KITSUME_DATA_TOKEN —— 这是**数据查询专用**令牌，
+   中台拿它反查出「这台工作台属于哪个用户」。它只对本组只读接口有效，
+   所以**即使令牌泄露，能读到的也只有这个用户自己的数据，而且调不了网关任何接口**。
 2. 地址从哪来：$KITSUME_API_BASE（中台在创建容器时注入）。它**不是命令行参数**，
    用户没法用 `--base` 把请求指向别的服务器。就算他 export 改了，
-   中台侧仍然只认 $GW_TOKEN ⇒ 改地址的结果是"自己读不到自己的数据"，无越权可能。
+   中台侧仍然只认 $KITSUME_DATA_TOKEN ⇒ 改地址的结果是"自己读不到自己的数据"，无越权可能。
 3. 越权怎么防：服务端**不接受** userId / tenantId / workspaceId 之类入参，
    全部由令牌反查。所以本 CLI 也一个都不传 —— 没有可以滥用的参数面。
 4. 数据范围：只有 owner 是自己的分身，以及自己的对话。
@@ -55,9 +55,9 @@ def die(msg, code=1):
 
 
 def env_token():
-    tok = (os.environ.get("GW_TOKEN") or "").strip()
+    tok = (os.environ.get("KITSUME_DATA_TOKEN") or "").strip()
     if not tok:
-        die("读不到 $GW_TOKEN，无法确定身份。\n"
+        die("读不到 $KITSUME_DATA_TOKEN，无法确定身份。\n"
             "本命令要在 kitsume 工作台容器里执行（令牌由中台注入，不需要你手动传）。")
     return tok
 
@@ -74,7 +74,7 @@ def call(method, path, body=None, query=None, timeout=TIMEOUT):
             url += "?" + urllib.parse.urlencode(clean)
 
     data = None
-    headers = {"X-GW-Token": env_token(), "Accept": "application/json"}
+    headers = {"X-Data-Token": env_token(), "Accept": "application/json"}
     if body is not None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json; charset=utf-8"
