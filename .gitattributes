@@ -9,6 +9,12 @@
 # Shell scripts should keep LF
 *.sh text eol=lf
 
+# 无扩展名的可执行脚本：必须显式声明。
+# 靠 `* text=auto` 的自动检测不稳，一旦被当成 binary 或被 checkout 成 CRLF，
+# 容器里的 shebang 会变成 "#!/usr/bin/env python3\r" 并报 "python3\r: not found" ——
+# 报错信息完全看不出是换行符问题。Dockerfile 里另有 sed 兜底，两边都留着。
+kitsume-data text eol=lf
+
 # Common binary assets
 *.png binary
 *.jpg binary

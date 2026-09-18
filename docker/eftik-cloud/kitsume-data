@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+kitsume-data —— 查询「我自己的」工作台数据（分身 / 知识库文档 / 对话记录）。
+
+只读。没有删除、没有修改、没有上传。
+
+============================ 安全边界（改之前必读） ============================
+1. 身份从哪来：容器 env 里的 $GW_TOKEN。它只是本工作台的网关令牌，
+   中台拿它反查出「这台工作台属于哪个用户」，所以**即使令牌泄露，
+   能读到的也只有这个用户自己的数据**。
+2. 地址从哪来：$KITSUME_API_BASE（中台在创建容器时注入）。它**不是命令行参数**，
+   用户没法用 `--base` 把请求指向别的服务器。就算他 export 改了，
+   中台侧仍然只认 $GW_TOKEN ⇒ 改地址的结果是"自己读不到自己的数据"，无越权可能。
+3. 越权怎么防：服务端**不接受** userId / tenantId / workspaceId 之类入参，
+   全部由令牌反查。所以本 CLI 也一个都不传 —— 没有可以滥用的参数面。
+4. 数据范围：只有 owner 是自己的分身，以及自己的对话。
+   「我在别人分身上聊过的」查不到，这是刻意的。
+5. 输出上限：知识库只给文档**元信息**（不给正文），消息强制分页 + 单条截断。
+   一个 30MB 的 PDF 直接把上下文炸了 —— 想知道内容用 `ask`，让分身自己概括。
+
+=============================== 子命令 ===============================
+  avatars                        我创建的全部分身
+  avatar  <avatarId>             分身详情（含简介、文档数）
+  docs    <avatarId>             该分身知识库的文档列表（仅元信息）
+  ask     <avatarId> <问题>      问分身（基于它自己的知识库回答）
+  convs   [--avatar ID] [--page N] [--size N]
+                                 我的对话列表
+  msgs    <conversationId> [--page N] [--size N] [--chars N]
+                                 某个对话的消息（--size 最多 50；--chars 最少 100，默认 2000）
+
+  用 `ask` 而不是想办法读原文：它返回的是**精炼过的**答案，天然不撑上下文。
+"""
+
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# 生产中台。本地联调时可以 export KITSUME_API_BASE=http://127.0.0.1:8081 覆盖。
+DEFAULT_BASE = "https://kitsume.eftik.com"
+
+TIMEOUT = 30
+# ask 要等模型出字，给足时间（服务端自己的上限是 120s，这里留点余量）
+ASK_TIMEOUT = 180
+
+USAGE = __doc__
+
+
+def die(msg, code=1):
+    sys.stderr.write(str(msg).rstrip() + "\n")
+    sys.exit(code)
+
+
+def env_token():
+    tok = (os.environ.get("GW_TOKEN") or "").strip()
+    if not tok:
+        die("读不到 $GW_TOKEN，无法确定身份。\n"
+            "本命令要在 kitsume 工作台容器里执行（令牌由中台注入，不需要你手动传）。")
+    return tok
+
+
+def env_base():
+    return (os.environ.get("KITSUME_API_BASE") or DEFAULT_BASE).rstrip("/")
+
+
+def call(method, path, body=None, query=None, timeout=TIMEOUT):
+    url = env_base() + path
+    if query:
+        clean = {k: v for k, v in query.items() if v is not None}
+        if clean:
+            url += "?" + urllib.parse.urlencode(clean)
+
+    data = None
+    headers = {"X-GW-Token": env_token(), "Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json; charset=utf-8"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        http_code = resp.status
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        http_code = e.code
+    except Exception as e:  # 连不上 / 超时 / DNS
+        die("连接中台失败（%s）：%s" % (env_base(), e))
+
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        die("中台返回的不是 JSON（HTTP %s）：%s" % (http_code, raw[:300]))
+
+    code = payload.get("code")
+    if code == 0:
+        return payload.get("data")
+
+    msg = payload.get("message") or "未知错误"
+    if http_code == 401 or code == 401:
+        die("身份校验没通过：%s\n（令牌可能已失效，或这台工作台已被中台重建）" % msg)
+    if http_code == 404 or code == 404:
+        die("找不到：%s\n（分身/对话不存在，或者它不属于当前用户）" % msg)
+    die("查询失败（HTTP %s / code %s）：%s" % (http_code, code, msg))
+
+
+# --------------------------------------------------------------------------
+# 输出：紧凑、一行一条。回包会直接进模型上下文，所以不做花哨排版、不重复字段名。
+# --------------------------------------------------------------------------
+
+def human_size(n):
+    try:
+        n = float(n or 0)
+    except (TypeError, ValueError):
+        return "-"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return ("%.0f%s" % (n, unit)) if unit == "B" else ("%.1f%s" % (n, unit))
+        n /= 1024.0
+
+
+def truthy(v):
+    return "是" if v else "否"
+
+
+def clip(s, n):
+    s = "" if s is None else str(s)
+    return s if len(s) <= n else s[:n] + "…"
+
+
+def need_int(argv, idx, name):
+    if len(argv) <= idx:
+        die("缺少参数：%s\n\n%s" % (name, USAGE))
+    raw = argv[idx]
+    try:
+        return int(raw)
+    except ValueError:
+        die("%s 必须是数字，收到 %r" % (name, raw))
+
+
+def opt_int(argv, flag, default=None):
+    if flag in argv:
+        i = argv.index(flag)
+        if i + 1 >= len(argv):
+            die("%s 后面要跟一个数字" % flag)
+        try:
+            return int(argv[i + 1])
+        except ValueError:
+            die("%s 后面要跟一个数字，收到 %r" % (flag, argv[i + 1]))
+    return default
+
+
+# --------------------------------------------------------------------------
+# 子命令
+# --------------------------------------------------------------------------
+
+def cmd_avatars(_args):
+    rows = call("GET", "/v1/workspace/data/avatars") or []
+    if not rows:
+        print("（当前用户还没有创建任何分身）")
+        return
+    print("我创建的分身（共 %d 个）：" % len(rows))
+    for a in rows:
+        print("  [%s] %s%s  在线=%s  文档=%s%s" % (
+            a.get("id"), a.get("emoji") or "", a.get("name") or "",
+            truthy(a.get("online")),
+            a.get("docCount") if a.get("docCount") is not None else "?",
+            ("  角色=%s" % a.get("roleName")) if a.get("roleName") else "",
+        ))
+    print("\n看详情：kitsume-data avatar <id>    问它：kitsume-data ask <id> \"问题\"")
+
+
+def cmd_avatar(args):
+    aid = need_int(args, 0, "avatarId")
+    a = call("GET", "/v1/workspace/data/avatars/%d" % aid) or {}
+    print("分身 #%s  %s%s" % (a.get("id"), a.get("emoji") or "", a.get("name") or ""))
+    if a.get("roleName"):
+        print("  角色：%s" % a["roleName"])
+    if a.get("intro"):
+        print("  简介：%s" % clip(a["intro"], 300))
+    print("  在线：%s   文档数：%s   创建于：%s" % (
+        truthy(a.get("online")), a.get("docCount"), a.get("createdAt") or "-"))
+    print("\n文档列表：kitsume-data docs %s" % aid)
+
+
+def cmd_docs(args):
+    aid = need_int(args, 0, "avatarId")
+    rows = call("GET", "/v1/workspace/data/avatars/%d/docs" % aid) or []
+    if not rows:
+        print("该分身的知识库还没有文档。")
+        return
+    print("分身 #%d 的知识库文档（%d 条，仅元信息）：" % (aid, len(rows)))
+    for d in rows:
+        print("  [%s] %s  %s  %s  %s" % (
+            d.get("id"), clip(d.get("fileName") or "(未命名)", 60),
+            human_size(d.get("sizeBytes")), d.get("sourceType") or "-",
+            d.get("status") or "-"))
+    print("\n⚠️ 这里只给元信息，没有正文。要了解内容请用："
+          "kitsume-data ask %d \"你的问题\"" % aid)
+
+
+def cmd_ask(args):
+    aid = need_int(args, 0, "avatarId")
+    question = " ".join(args[1:]).strip()
+    if not question:
+        die("要问什么？用法：kitsume-data ask <avatarId> \"你的问题\"")
+    r = call("POST", "/v1/workspace/data/avatars/%d/ask" % aid,
+             body={"question": question}, timeout=ASK_TIMEOUT) or {}
+    print("【%s】%s" % (r.get("avatarName") or ("分身#" + str(aid)), r.get("question") or question))
+    print("")
+    print(r.get("answer") or "（没有返回内容）")
+    meta = ["耗时 %.1fs" % ((r.get("elapsedMs") or 0) / 1000.0)]
+    if r.get("truncated"):
+        meta.append("答案过长已截断，需要更多细节请缩小问题范围")
+    print("\n（%s）" % "；".join(meta))
+
+
+def cmd_convs(args):
+    data = call("GET", "/v1/workspace/data/conversations", query={
+        "avatarId": opt_int(args, "--avatar"),
+        "page": opt_int(args, "--page"),
+        "size": opt_int(args, "--size"),
+    }) or {}
+    items = data.get("items") or []
+    if not items:
+        print("（没有可显示的对话）")
+        return
+    total = int(data.get("total") or 0)
+    page_size = int(data.get("pageSize") or 1) or 1
+    pages = max(1, (total + page_size - 1) // page_size)
+    print("我的对话（共 %d 条，第 %s/%d 页）：" % (total, data.get("page"), pages))
+    for c in items:
+        print("  [%s] 分身#%s  %s  最后消息=%s" % (
+            c.get("id"), c.get("avatarId"), clip(c.get("title") or "(无标题)", 40),
+            c.get("lastMsgAt") or "-"))
+    print("\n看消息：kitsume-data msgs <对话id>")
+
+
+def cmd_msgs(args):
+    cid = need_int(args, 0, "conversationId")
+    chars = opt_int(args, "--chars")
+    # 服务端把「< 100」当作没传（避免有人传 1 导致什么都看不到）。这里必须显式拦住：
+    # 否则用户写了 --chars 60、看到没截断，会以为参数坏了 —— 静默忽略比报错难查得多。
+    if chars is not None and chars < 100:
+        die("--chars 最小 100（更小的值服务端会当作没传），当前收到 %d" % chars)
+    data = call("GET", "/v1/workspace/data/conversations/%d/messages" % cid, query={
+        "page": opt_int(args, "--page"),
+        "size": opt_int(args, "--size"),
+        "maxChars": chars,
+    }) or {}
+    items = data.get("items") or []
+    print("对话「%s」（共 %s 条消息，本页 %d 条）：" % (
+        clip(data.get("title") or "-", 40), data.get("total"), len(items)))
+    for m in items:
+        who = {"user": "我", "assistant": "分身"}.get(m.get("role"), m.get("role"))
+        print("  [%s] %s：%s%s" % (
+            m.get("id"), who, m.get("content") or "",
+            "（本条已截断）" if m.get("truncated") else ""))
+
+
+COMMANDS = {
+    "avatars": cmd_avatars,
+    "avatar": cmd_avatar,
+    "docs": cmd_docs,
+    "ask": cmd_ask,
+    "convs": cmd_convs,
+    "msgs": cmd_msgs,
+}
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        print(USAGE.strip())
+        return 0
+    cmd = COMMANDS.get(argv[1])
+    if cmd is None:
+        sys.stderr.write("未知子命令：%s\n\n%s\n" % (argv[1], USAGE.strip()))
+        return 2
+    # ⚠️ 只把**业务参数**传给子命令（argv[2:]）。
+    # 早先直接把整个 argv 传下去，子命令里用 argv[1] 取第一个参数 —— 拿到的其实是
+    # 子命令名自己（`avatar 3` → 取到 "avatar"），于是所有位置参数命令全报"必须是数字"。
+    cmd(argv[2:])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

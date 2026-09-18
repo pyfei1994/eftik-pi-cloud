@@ -338,6 +338,29 @@ const engine = createPiEngine({
 });
 engine.start();
 
+/**
+ * 固定追加到每轮上下文末尾的「数据 CLI」能力说明。
+ *
+ * 为什么硬编码在这里、而不是让中台 Admin 那份 systemPreamble 一起管：
+ * 中台那份是**给用户写人设**的，这条是**产品内置能力说明书** ——
+ * 混在一起会出现「用户改人设顺手把这段删了」的情况，能力就悄悄失效了。
+ * 所以网关固定追加、排在用户配置**之后**（用户说的话优先，这里是兜底说明）。
+ * 要改文案就改这个数组，跟镜像一起发版。
+ *
+ * 只在真的能提供这份能力时才加：容器里没有 GW_TOKEN 就没有身份，
+ * 加了说明只会让模型去调一个必然失败的命令。
+ */
+const DATA_CLI_NOTE = [
+  "【本机有一个只读命令：kitsume-data】",
+  "可查当前账号自己的数据：他创建的分身、每个分身知识库的文档列表、历史对话与消息。",
+  "用法：先 `kitsume-data` 看帮助；子命令 `kitsume-data avatars` / `docs <分身id>` / `ask <分身id> \"问题\"` / `convs` / `msgs <对话id>`。",
+  "纪律：",
+  "1) 它只能查到当前账号自己的数据（别人的查不到），且只有查询、没有删除和修改。",
+  "2) 想知道某个知识库文档讲了什么，用 `ask` 让分身自己概括。**不要去读文件原文**：那些文档不在本机磁盘上，而且大文件会把上下文撑爆。",
+  "3) 命令返回本身有长度上限，看到「已截断」就把问题问得更具体，不要反复拉全量。",
+  "4) 用户没提到他自己的数据时，不用主动调用。",
+].join("\n");
+
 function startJob(message, sessionId, images, scheduledTaskId) {
   const job = { id: crypto.randomUUID(), createdAt: Date.now(), status: "queued", reply: "", usage: null, events: [], interactions: new Map(), error: "", errorCode: "", done: false, thinkingSeen: false, thinkingFinished: false, userTurnStarted: false, scheduledTaskId, sessionId: scheduledTaskId ? "" : sessionId };
   job.completion = new Promise((resolve) => { job.resolveCompletion = resolve; });
@@ -364,8 +387,12 @@ function startJob(message, sessionId, images, scheduledTaskId) {
       // system preamble（中台统一配置、下发到这里）：与 DSH 的 buildSystemPreamble 同一套路，
       // 作为上下文前缀随本轮一起发。没配就不加，避免污染普通对话。
       const preamble = typeof settings.systemPreamble === "string" ? settings.systemPreamble.trim() : "";
-      const outgoing = preamble ? `${preamble}\n\n${message}` : message;
-      console.log(`[pi-gw] turn model=${wanted || "(default)"}${images && images.length ? " (vision)" : ""} preamble=${preamble ? preamble.length + "字" : "无"}`);
+      // 追加数据 CLI 说明（放在用户配置之后）。没有 GW_TOKEN 就没有身份，此时不追加 ——
+      // 否则模型会去调一个必然失败的命令，反而浪费一轮。
+      const note = process.env.GW_TOKEN ? DATA_CLI_NOTE : "";
+      const composed = [preamble, note].filter(Boolean).join("\n\n");
+      const outgoing = composed ? `${composed}\n\n${message}` : message;
+      console.log(`[pi-gw] turn model=${wanted || "(default)"}${images && images.length ? " (vision)" : ""} preamble=${preamble ? preamble.length + "字" : "无"}+dataCli=${note ? note.length + "字" : "无"}`);
       if (job.sessionId) appendSessionMessage(job.sessionId, "user", message);
       await engine.prompt(outgoing, images);
       await job.completion;
