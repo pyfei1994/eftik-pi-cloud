@@ -164,10 +164,22 @@ def cmd_avatars(_args):
         return
     print("我创建的分身（共 %d 个）：" % len(rows))
     for a in rows:
-        print("  [%s] %s%s  在线=%s  文档=%s%s" % (
+        # 状态用后端给的中文（在线/离线/已锁定）。**不要只打 online 的 True/False** ——
+        # 「离线」是用户自己关的（上线即可），「已锁定」是会员权益过期被系统下线（得先去恢复），
+        # 两者处理方式完全不同，模型只看布尔值会一律说「离线了」，用户照着做也恢复不了。
+        state = a.get("statusText") or ("在线" if truthy(a.get("online")) else "离线")
+        cap = ""
+        if a.get("quotaMb"):
+            cap = "  容量=%s/%sMB" % (a.get("usedMb", "?"), a.get("quotaMb"))
+            if a.get("canFeed") is False:
+                # 不能投喂有两种原因，必须分开说：说错了模型会给出没用的建议
+                # （明明是「已锁定」，却让用户去清理旧资料）。
+                cap += "（已锁定，不能投喂）" if a.get("status") == "locked" else "（已满，不能再喂）"
+        print("  [%s] %s%s  状态=%s  文档=%s%s%s" % (
             a.get("id"), a.get("emoji") or "", a.get("name") or "",
-            truthy(a.get("online")),
+            state,
             a.get("docCount") if a.get("docCount") is not None else "?",
+            cap,
             ("  角色=%s" % a.get("roleName")) if a.get("roleName") else "",
         ))
     print("\n看详情：kitsume-data avatar <id>    问它：kitsume-data ask <id> \"问题\"")
@@ -181,8 +193,14 @@ def cmd_avatar(args):
         print("  角色：%s" % a["roleName"])
     if a.get("intro"):
         print("  简介：%s" % clip(a["intro"], 300))
-    print("  在线：%s   文档数：%s   创建于：%s" % (
-        truthy(a.get("online")), a.get("docCount"), a.get("createdAt") or "-"))
+    print("  状态：%s   文档数：%s   创建于：%s" % (
+        a.get("statusText") or truthy(a.get("online")), a.get("docCount"), a.get("createdAt") or "-"))
+    if a.get("quotaMb"):
+        line = "  容量：%s / %s MB" % (a.get("usedMb"), a.get("quotaMb"))
+        if a.get("canFeed") is False:
+            line += ("（该分身已锁定，要用户先在 App 里恢复它，暂时不能投喂）"
+                     if a.get("status") == "locked" else "（容量已满，先清理旧资料）")
+        print(line)
     print("\n文档列表：kitsume-data docs %s" % aid)
 
 

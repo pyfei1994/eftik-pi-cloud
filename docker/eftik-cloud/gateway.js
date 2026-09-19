@@ -359,6 +359,9 @@ const DATA_CLI_NOTE = [
   "2) 想知道某个知识库文档讲了什么，用 `ask` 让分身自己概括。**不要去读文件原文**：那些文档不在本机磁盘上，而且大文件会把上下文撑爆。",
   "3) 命令返回本身有长度上限，看到「已截断」就把问题问得更具体，不要反复拉全量。",
   "4) 用户没提到他自己的数据时，不用主动调用。",
+  // 分身能不能继续投喂，看 avatars 的 canFeed / status / remainingMb —— 直接把判据交代清楚，
+  // 否则模型看到 online:false 只会说「离线了」，而「已锁定」用户照着做也恢复不了。
+  "5) 分身能不能再喂资料看 `avatars` 里的 `canFeed`：`status=locked` 表示它因会员权益过期被系统下线（要让用户先在 App 里恢复它），`remainingMb=0` 表示知识库已满（要先清理旧资料）。**投喂只能由用户在「工作台 → 文件」页里点，本机命令不能喂。**",
 ].join("\n");
 
 function startJob(message, sessionId, images, scheduledTaskId) {
