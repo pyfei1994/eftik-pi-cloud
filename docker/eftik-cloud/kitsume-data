@@ -126,6 +126,55 @@ def truthy(v):
     return "是" if v else "否"
 
 
+# ---- 内部枚举 → 用户看得懂的中文 -------------------------------------------
+# 这些字段内部是 file/text/link、pending/parsing/digested 之类英文枚举，
+# 直接打出来模型会原样念给用户听，用户看不懂。取值口径与中台/小程序保持一致
+# （解析中/已入库 这套词在 Kb.vue、avatar-detail 里就是这么用的）。
+# 映射不到就退回原值 —— 宁可露出原值，也不要静默吞掉信息让人以为「查不到」。
+SOURCE_ZH = {
+    "file": "文件", "text": "文本", "link": "网页", "url": "网页",
+    "image": "图片", "audio": "语音", "voice": "语音", "composite": "图文",
+}
+DOC_STATUS_ZH = {
+    "pending": "待解析", "parsing": "解析中", "running": "解析中",
+    "digested": "已入库", "parsed": "已入库", "success": "已入库", "done": "已入库",
+    "failed": "解析失败", "error": "解析失败",
+}
+
+
+def zh(mapping, value):
+    if value is None or value == "":
+        return "-"
+    return mapping.get(str(value).strip().lower(), str(value))
+
+
+def short_time(v):
+    """2026-09-20T04:55:38 → 09-20 04:55。原始 ISO 串是机器格式，用户不关心年份和秒。"""
+    s = "" if v is None else str(v)
+    if len(s) >= 16 and s[4] == "-" and s[10] in ("T", " "):
+        return "%s %s" % (s[5:10], s[11:16])
+    return s or "-"
+
+
+def avatar_name_of(avatar_id):
+    """按 id 反查分身名字，用于「别把内部 id 显示给用户」。
+
+    只为展示用：查不到就返回 None，调用方就不显示这一列 —— **绝不退回显示 id**。
+    列表本身很短，一次请求就够；失败静默（展示层不该因为查名字失败而中断）。
+    """
+    if avatar_id is None:
+        return None
+    try:
+        for a in call("GET", "/v1/workspace/data/avatars") or []:
+            if str(a.get("id")) == str(avatar_id):
+                return a.get("name")
+    except SystemExit:
+        return None
+    except Exception:
+        return None
+    return None
+
+
 def clip(s, n):
     s = "" if s is None else str(s)
     return s if len(s) <= n else s[:n] + "…"
@@ -193,8 +242,8 @@ def cmd_avatar(args):
         print("  角色：%s" % a["roleName"])
     if a.get("intro"):
         print("  简介：%s" % clip(a["intro"], 300))
-    print("  状态：%s   文档数：%s   创建于：%s" % (
-        a.get("statusText") or truthy(a.get("online")), a.get("docCount"), a.get("createdAt") or "-"))
+    print("  状态：%s   资料：%s 份" % (
+        a.get("statusText") or truthy(a.get("online")), a.get("docCount")))
     if a.get("quotaMb"):
         line = "  容量：%s / %s MB" % (a.get("usedMb"), a.get("quotaMb"))
         if a.get("canFeed") is False:
@@ -210,12 +259,12 @@ def cmd_docs(args):
     if not rows:
         print("该分身的知识库还没有文档。")
         return
-    print("分身 #%d 的知识库文档（%d 条，仅元信息）：" % (aid, len(rows)))
+    print("该分身的知识库资料（共 %d 份，仅元信息）：" % len(rows))
     for d in rows:
-        print("  [%s] %s  %s  %s  %s" % (
-            d.get("id"), clip(d.get("fileName") or "(未命名)", 60),
-            human_size(d.get("sizeBytes")), d.get("sourceType") or "-",
-            d.get("status") or "-"))
+        # 不印文档 id（没有 <docId> 级命令用它，纯内部字段）；来源/状态映射成中文。
+        print("  %s  %s  来源=%s  状态=%s" % (
+            clip(d.get("fileName") or "(未命名)", 60), human_size(d.get("sizeBytes")),
+            zh(SOURCE_ZH, d.get("sourceType")), zh(DOC_STATUS_ZH, d.get("status"))))
     print("\n⚠️ 这里只给元信息，没有正文。要了解内容请用："
           "kitsume-data ask %d \"你的问题\"" % aid)
 
@@ -227,13 +276,12 @@ def cmd_ask(args):
         die("要问什么？用法：kitsume-data ask <avatarId> \"你的问题\"")
     r = call("POST", "/v1/workspace/data/avatars/%d/ask" % aid,
              body={"question": question}, timeout=ASK_TIMEOUT) or {}
-    print("【%s】%s" % (r.get("avatarName") or ("分身#" + str(aid)), r.get("question") or question))
+    print("【%s】%s" % (r.get("avatarName") or "分身", r.get("question") or question))
     print("")
     print(r.get("answer") or "（没有返回内容）")
-    meta = ["耗时 %.1fs" % ((r.get("elapsedMs") or 0) / 1000.0)]
+    # 不报耗时这类技术指标：用户不关心，模型却容易顺口念出来。
     if r.get("truncated"):
-        meta.append("答案过长已截断，需要更多细节请缩小问题范围")
-    print("\n（%s）" % "；".join(meta))
+        print("\n（答案过长已截断，需要更多细节请缩小问题范围）")
 
 
 def cmd_convs(args):
@@ -251,9 +299,14 @@ def cmd_convs(args):
     pages = max(1, (total + page_size - 1) // page_size)
     print("我的对话（共 %d 条，第 %s/%d 页）：" % (total, data.get("page"), pages))
     for c in items:
-        print("  [%s] 分身#%s  %s  最后消息=%s" % (
-            c.get("id"), c.get("avatarId"), clip(c.get("title") or "(无标题)", 40),
-            c.get("lastMsgAt") or "-"))
+        # [id] 是给下一条 `msgs <对话id>` 用的句柄，必须留（但别念给用户，见 DATA_CLI_NOTE）。
+        # 标题自带「与 X 的对话」时就不再重复前缀（本项目标题都是自动生成的）——
+        # 只在标题看不出是哪个分身时才补上名字，且**查不到名字就整段省略**，绝不退回打 id。
+        title = clip(c.get("title") or "(无标题)", 40)
+        who = avatar_name_of(c.get("avatarId"))
+        if who and who not in title:
+            title = "「%s」 %s" % (who, title)
+        print("  [%s] %s  最后消息=%s" % (c.get("id"), title, short_time(c.get("lastMsgAt"))))
     print("\n看消息：kitsume-data msgs <对话id>")
 
 
@@ -274,8 +327,9 @@ def cmd_msgs(args):
         clip(data.get("title") or "-", 40), data.get("total"), len(items)))
     for m in items:
         who = {"user": "我", "assistant": "分身"}.get(m.get("role"), m.get("role"))
-        print("  [%s] %s：%s%s" % (
-            m.get("id"), who, m.get("content") or "",
+        # 不印消息 id：没有任何子命令用它，纯内部字段，印出来只会被原样转述给用户。
+        print("  %s：%s%s" % (
+            who, m.get("content") or "",
             "（本条已截断）" if m.get("truncated") else ""))
 
 
