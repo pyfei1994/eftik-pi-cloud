@@ -306,7 +306,12 @@ def cmd_convs(args):
         who = avatar_name_of(c.get("avatarId"))
         if who and who not in title:
             title = "「%s」 %s" % (who, title)
-        print("  [%s] %s  最后消息=%s" % (c.get("id"), title, short_time(c.get("lastMsgAt"))))
+        # ⚠️⚠️ owned 为 False 表示**这是别人分享给他的分身**，**不是被删除的分身**。
+        # 必须显式标出来：否则模型发现「这个名字在 avatars 里查不到」（`avatars` 只列自己的），
+        # 就会自己推断成「分身已被删除」并这么告诉用户 —— 2026-09-20 用户实测被这么误导过。
+        # 措辞写成自解释的：模型照抄这一行也不会说错。
+        mark = "（他人分享的分身，未被删除）" if c.get("owned") is False else ""
+        print("  [%s] %s%s  最后消息=%s" % (c.get("id"), title, mark, short_time(c.get("lastMsgAt"))))
     print("\n看消息：kitsume-data msgs <对话id>")
 
 
