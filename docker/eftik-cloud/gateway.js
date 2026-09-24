@@ -186,6 +186,9 @@ function classifyError(raw) {
 
 function finish(job, status, errorCode = "", error = "") {
   if (job.done) return;
+  if (status === "done" && job.generatedImageMarkdown && !job.reply.includes(job.generatedImageMarkdown)) {
+    job.reply = [job.reply.trim(), job.generatedImageMarkdown].filter(Boolean).join("\n\n");
+  }
   job.done = true;
   job.status = status;
   job.errorCode = errorCode;
@@ -330,6 +333,12 @@ const engine = createPiEngine({
       pushLog(active, `执行工具 ${event.toolName || event.name || ""}`);
     } else if (event.type === "tool_execution_end") {
       pushLog(active, `工具 ${event.isError ? "失败" : "完成"} ${event.toolName || event.name || ""}`);
+      if (!event.isError && event.toolName === "generate_image") {
+        const urls = event.result && event.result.details && Array.isArray(event.result.details.urls)
+          ? event.result.details.urls.filter((url) => typeof url === "string" && /^https:\/\//i.test(url))
+          : [];
+        if (urls.length) active.generatedImageMarkdown = urls.map((url, index) => `![生成图片 ${index + 1}](${url})`).join("\n\n");
+      }
     } else if (event.type === "extension_ui_request") {
       active.interactions.set(event.id, event);
       active.events.push({ type: "interaction", data: event });
@@ -374,7 +383,7 @@ const DATA_CLI_NOTE = [
 ].join("\n");
 
 function startJob(message, sessionId, images, scheduledTaskId) {
-  const job = { id: crypto.randomUUID(), createdAt: Date.now(), status: "queued", reply: "", usage: null, events: [], interactions: new Map(), error: "", errorCode: "", done: false, thinkingSeen: false, thinkingFinished: false, userTurnStarted: false, scheduledTaskId, sessionId: scheduledTaskId ? "" : sessionId };
+  const job = { id: crypto.randomUUID(), createdAt: Date.now(), status: "queued", reply: "", generatedImageMarkdown: "", usage: null, events: [], interactions: new Map(), error: "", errorCode: "", done: false, thinkingSeen: false, thinkingFinished: false, userTurnStarted: false, scheduledTaskId, sessionId: scheduledTaskId ? "" : sessionId };
   job.completion = new Promise((resolve) => { job.resolveCompletion = resolve; });
   jobs.set(job.id, job);
   void enqueue(async () => {

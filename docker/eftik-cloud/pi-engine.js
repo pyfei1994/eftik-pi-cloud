@@ -30,7 +30,12 @@ function createPiEngine({ onEvent = () => {}, onExit = () => {} } = {}) {
 
   function start() {
     if (child && child.exitCode === null) return;
-    const args = ["--mode", "rpc", "--session-dir", process.env.PI_CODING_AGENT_SESSION_DIR || "/home/node/.pi/sessions"];
+    const args = [
+      "--mode", "rpc",
+      "--session-dir", process.env.PI_CODING_AGENT_SESSION_DIR || "/home/node/.pi/sessions",
+      // 平台内置图片工具不登记到用户 settings.json，用户无法通过 pi remove 卸载。
+      "--extension", "/opt/gw/platform-image-gen.ts",
+    ];
     // The model may invoke `env` through bash. Gateway ingress credentials are
     // not needed by PI and must never enter that child process.
     const { GW_TOKEN: _gatewayToken, GW_ADMIN_TOKEN: _adminToken, ...piEnv } = process.env;
