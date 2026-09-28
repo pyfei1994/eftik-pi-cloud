@@ -24,13 +24,15 @@ RUN apt-get update \
     && npm install -g @earendil-works/pi-coding-agent@${PI_VERSION} \
     && pi --version
 
-COPY gateway.js pi-engine.js model-proxy.js skill-installer.py entrypoint.sh kitsume-data platform-image-gen.ts /opt/gw/
+COPY gateway.js pi-engine.js model-proxy.js skill-installer.py entrypoint.sh kitsume-data kitsume-credential kitsume-skill platform-image-gen.ts /opt/gw/
 # sed 兜底 CRLF：在 Windows 上编辑会让 shebang 变成 "#!/usr/bin/env python3\r"，
 # 容器里报 "python3\r: not found"，且报错信息完全看不出是换行符的问题。
 # kitsume-data 放到 /usr/local/bin 是为了让 agent 直接敲 `kitsume-data` 就能用。
-RUN sed -i 's/\r$//' /opt/gw/kitsume-data /opt/gw/entrypoint.sh \
-    && chmod 0755 /opt/gw/entrypoint.sh /opt/gw/kitsume-data \
+RUN sed -i 's/\r$//' /opt/gw/kitsume-data /opt/gw/kitsume-credential /opt/gw/kitsume-skill /opt/gw/entrypoint.sh \
+    && chmod 0755 /opt/gw/entrypoint.sh /opt/gw/kitsume-data /opt/gw/kitsume-credential /opt/gw/kitsume-skill \
     && ln -sf /opt/gw/kitsume-data /usr/local/bin/kitsume-data \
+    && ln -sf /opt/gw/kitsume-credential /usr/local/bin/kitsume-credential \
+    && ln -sf /opt/gw/kitsume-skill /usr/local/bin/kitsume-skill \
     && kitsume-data --help > /dev/null \
     && mkdir -p /home/node/.pi/agent /home/node/.pi/sessions /workspace \
     && chown -R node:node /home/node /workspace

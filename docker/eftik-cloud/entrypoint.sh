@@ -6,6 +6,11 @@
 set -eu
 mkdir -p /home/node/.pi/agent /home/node/.pi/sessions /workspace 2>/dev/null || true
 chown -R node:node /home/node/.pi /workspace 2>/dev/null || true
+# The model can run shell commands as node. Keep the unreported billing queue
+# in a root-owned directory on the persistent volume so it cannot erase usage.
+mkdir -p /home/node/.pi/.model-billing
+chown -R root:root /home/node/.pi/.model-billing
+chmod 700 /home/node/.pi/.model-billing
 node /opt/gw/model-proxy.js &
 proxy_pid=$!
 trap 'kill "$proxy_pid" 2>/dev/null || true; exit 0' INT TERM

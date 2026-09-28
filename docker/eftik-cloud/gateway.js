@@ -24,7 +24,8 @@ const skillsPath = process.env.GW_SKILLS_PATH || "/home/node/.pi/eftik-skills.js
 const tasksPath = process.env.GW_TASKS_PATH || "/home/node/.pi/eftik-tasks.json";
 const pluginsPath = process.env.GW_PLUGINS_PATH || "/home/node/.pi/eftik-plugins.json";
 const execFileAsync = promisify(execFile);
-const { GW_TOKEN: _pluginGatewayToken, MODEL_PROXY_UPSTREAM_API_KEY: _pluginModelKey, ...pluginInstallEnv } = process.env;
+const { GW_TOKEN: _pluginGatewayToken, MODEL_PROXY_UPSTREAM_API_KEY: _pluginModelKey,
+  KITSUME_CREDENTIAL_TOKEN: _pluginCredentialToken, ...pluginInstallEnv } = process.env;
 const maxDownloadBytes = Math.max(1, Number(process.env.GW_MAX_DOWNLOAD_MB) || 200) * 1024 * 1024;
 const maxSkillArchiveBytes = Math.max(1, Number(process.env.GW_MAX_SKILL_ARCHIVE_MB) || 10) * 1024 * 1024;
 const maxChatImages = 4;
@@ -73,14 +74,75 @@ function appendSessionMessage(id, role, content) {
 function loadSettings() { try { return JSON.parse(fs.readFileSync(settingsPath, "utf8")); } catch (error) { return {}; } }
 function saveSettings(settings) { fs.mkdirSync(path.dirname(settingsPath), { recursive: true }); fs.writeFileSync(settingsPath, JSON.stringify(settings), { mode: 0o600 }); }
 function loadSkills() { try { return JSON.parse(fs.readFileSync(skillsPath, "utf8")).skills || []; } catch (error) { return []; } }
+function isInstallPlaceholder(skill) {
+  return typeof skill.prompt === "string" && /^\s*请根据\s+https:\/\/(?:www\.)?skillhub\.cn\/install\/skillhub\.md\s*[，,]\s*安装\s+@[\w-]+\/[\w-]+\s*[。.]?\s*$/.test(skill.prompt);
+}
+function visibleSkills() {
+  const skills = loadSkills().filter(skill => !isInstallPlaceholder(skill)
+    && /^[\w-]{1,64}$/.test(skill.id)
+    && fs.existsSync(path.join(skillDirectory(skill.id), "SKILL.md")));
+  const registered = new Set(skills.map(skill => skill.id));
+  const root = path.join(process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", "skills");
+  const pending = [{ directory: root, parts: [] }];
+  let visited = 0;
+  while (pending.length && visited++ < 500) {
+    const { directory, parts } = pending.shift();
+    let entries;
+    try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^@?[\w-]{1,64}$/.test(entry.name)) continue;
+      const nextParts = [...parts, entry.name];
+      const nextDirectory = path.join(directory, entry.name);
+      if (nextParts.length < 4) pending.push({ directory: nextDirectory, parts: nextParts });
+      const id = nextParts.map(part => part.replace(/^@/, "")).join("--");
+      if (id.length > 64 || registered.has(id)) continue;
+      try {
+        const file = path.join(nextDirectory, "SKILL.md");
+        const stat = fs.lstatSync(file);
+        if (!stat.isFile() || stat.size > 100 * 1024) continue;
+        const prompt = fs.readFileSync(file, "utf8");
+        const header = prompt.match(/^\uFEFF?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+        const title = header && header[1].match(/^name:\s*(.+)\s*$/im);
+        const manifestName = title ? title[1].trim().replace(/^["']|["']$/g, "") : entry.name;
+        const slug = entry.name.includes("--") ? entry.name.split("--").slice(1).join("--") : "";
+        const name = slug || manifestName || entry.name;
+        skills.push({ id, name, manifestName: manifestName !== name ? manifestName : "", description: "对话中添加的技能", prompt,
+          requiredParams: inferredParameters(prompt), enabled: true, sourceType: "conversation" });
+        registered.add(id);
+      } catch { /* 技能文件正在写入或已移除，下次读取时再显示 */ }
+    }
+  }
+  return skills;
+}
 function saveSkills(skills) { fs.mkdirSync(path.dirname(skillsPath), { recursive: true }); fs.writeFileSync(skillsPath, JSON.stringify({ skills }), { mode: 0o600 }); }
 function skillDirectory(id) { return path.join(process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", "skills", id); }
+function inferredParameters(prompt) {
+  return [...new Set(String(prompt || "").match(/\b(?:[A-Z_][A-Z0-9_]*_(?:API_KEY|API_BASE|API_URL|TOKEN|BASE_URL|KEY|ENDPOINT)|API_KEY|BASE_URL|TOKEN)\b/g) || [])].slice(0, 20);
+}
+function credentialInstruction(skill) {
+  const names = Array.isArray(skill.requiredParams) ? skill.requiredParams : inferredParameters(skill.prompt);
+  const required = names.length ? `该技能声明的参数名：${names.join("、")}。` : "请从技能正文确认它实际需要的参数名。";
+  return `\n\n## 工作台参数\n此技能的配置作用域是 ${skill.id}。${required}如果技能需要 API Key、Token、API 地址等参数，运行脚本时必须用 \`kitsume-credential run ${skill.id} 参数名[,参数名...] -- 命令 参数\`。参数名必须与技能说明完全一致（区分大小写）。CLI 只把指定参数放入该命令的环境变量，不会打印参数值。直接让 CLI 启动脚本，避免在父 shell 中先展开变量。若返回 MISSING_CREDENTIAL，不要索要聊天中的密钥；告诉用户缺少的参数名，并引导至「工作台 → Skills 技能 → API Key/凭证」配置。`;
+}
 function writeSkill(skill) {
   if (skill.installUrl) return; // 链接包自带 SKILL.md，不能被表单 prompt 覆盖。
   const directory = skillDirectory(skill.id);
   fs.mkdirSync(directory, { recursive: true });
-  const content = `---\nname: ${JSON.stringify(skill.name)}\ndescription: ${JSON.stringify(skill.description || skill.name)}\n---\n\n${skill.prompt}\n`;
+  const content = `---\nname: ${JSON.stringify(skill.name)}\ndescription: ${JSON.stringify(skill.description || skill.name)}\n---\n\n${skill.prompt}${credentialInstruction(skill)}\n`;
   fs.writeFileSync(path.join(directory, "SKILL.md"), content, { mode: 0o600 });
+}
+function refreshSkillCredentialInstructions() {
+  const skills = loadSkills(); let changed = false;
+  for (const skill of skills) {
+    const file = path.join(skillDirectory(skill.id), "SKILL.md");
+    if (!fs.existsSync(file)) continue;
+    if (!Array.isArray(skill.requiredParams)) { skill.requiredParams = inferredParameters(skill.prompt); changed = true; }
+    const content = fs.readFileSync(file, "utf8");
+    if (!content.includes("## 工作台参数\n此技能的配置作用域是")) {
+      fs.appendFileSync(file, credentialInstruction(skill));
+    }
+  }
+  if (changed) saveSkills(skills);
 }
 function isPrivateAddress(address) {
   if (net.isIPv4(address)) {
@@ -128,6 +190,8 @@ async function installSkillPackage(skill, installUrl) {
     await execFileAsync("python3", ["/opt/gw/skill-installer.py", tmp, directory], { timeout: 30000, maxBuffer: 64 * 1024 });
     const prompt = fs.readFileSync(path.join(directory, "SKILL.md"), "utf8");
     if (prompt.length > 100 * 1024) throw new Error("SKILL.md 超过 100 KB 限制");
+    skill.requiredParams = inferredParameters(prompt);
+    fs.appendFileSync(path.join(directory, "SKILL.md"), credentialInstruction(skill));
     skill.installUrl = installUrl;
     skill.prompt = prompt;
   } finally { try { fs.unlinkSync(tmp); } catch {} }
@@ -137,6 +201,13 @@ function saveTasks(tasks) { fs.mkdirSync(path.dirname(tasksPath), { recursive: t
 function trimTaskRuns(task) { task.runs = (task.runs || []).sort((left, right) => (right.finishedAt || right.at || 0) - (left.finishedAt || left.at || 0)).slice(0, maxTaskRuns); }
 function loadPlugins() { try { return JSON.parse(fs.readFileSync(pluginsPath, "utf8")).plugins || []; } catch (error) { return []; } }
 function savePlugins(plugins) { fs.mkdirSync(path.dirname(pluginsPath), { recursive: true }); fs.writeFileSync(pluginsPath, JSON.stringify({ plugins }), { mode: 0o600 }); }
+function ensureMemoryPluginConfig() {
+  const configPath = path.join(process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", "hermes-memory-config.json");
+  if (fs.existsSync(configPath)) return; // Respect a user's existing memory settings.
+  fs.writeFileSync(configPath, JSON.stringify({
+    memoryMode: "legacy-inject", userCharLimit: 2000, memoryCharLimit: 3000, projectCharLimit: 3000,
+  }), { mode: 0o600, flag: "wx" });
+}
 function publicPlugin(item) {
   const { spec, ...safe } = item;
   return { ...safe, status: item.status || "installed", error: item.error || "" };
@@ -166,6 +237,7 @@ function recoverInterruptedTasks() {
   if (changed) saveTasks(tasks);
 }
 recoverInterruptedTasks();
+refreshSkillCredentialInstructions();
 
 /**
  * 把内核/网络抛出的原始错误归到稳定错误码上。
@@ -186,6 +258,10 @@ function classifyError(raw) {
 
 function finish(job, status, errorCode = "", error = "") {
   if (job.done) return;
+  if (job.missingCredential) {
+    const { skillName, names } = job.missingCredential;
+    job.reply = `使用「${skillName}」还缺少参数：${names.join("、")}。请到「工作台 → Skills 技能 → API Key/凭证」选择这个技能，按上述参数名添加后再试。`;
+  }
   if (status === "done" && job.generatedImageMarkdown && !job.reply.includes(job.generatedImageMarkdown)) {
     job.reply = [job.reply.trim(), job.generatedImageMarkdown].filter(Boolean).join("\n\n");
   }
@@ -196,6 +272,7 @@ function finish(job, status, errorCode = "", error = "") {
   job.finishedAt = Date.now();
   job.events.push({ type: "done", data: {
     reply: job.reply,
+    missing_credential: Boolean(job.missingCredential),
     usage: job.usage,
     status,
     error_code: errorCode,
@@ -233,6 +310,7 @@ function normalizeUsage(raw) {
   if (!raw || typeof raw !== "object") return null;
   const pick = (...vals) => { for (const v of vals) if (v != null) return v; return null; };
   return {
+    billingSource: "model-proxy",
     calls: pick(raw.calls, 1),
     inputTokens: pick(raw.inputTokens, raw.input),
     outputTokens: pick(raw.outputTokens, raw.output),
@@ -333,6 +411,11 @@ const engine = createPiEngine({
       pushLog(active, `执行工具 ${event.toolName || event.name || ""}`);
     } else if (event.type === "tool_execution_end") {
       pushLog(active, `工具 ${event.isError ? "失败" : "完成"} ${event.toolName || event.name || ""}`);
+      const missing = JSON.stringify(event.result || {}).match(/MISSING_CREDENTIAL\s+([\w-]{1,64})\/([A-Za-z_][A-Za-z0-9_,]{0,255})/);
+      if (missing) {
+        const skill = visibleSkills().find(item => item.id === missing[1]);
+        active.missingCredential = { skillName: skill ? skill.name : missing[1], names: missing[2].split(",") };
+      }
       if (!event.isError && event.toolName === "generate_image") {
         const urls = event.result && event.result.details && Array.isArray(event.result.details.urls)
           ? event.result.details.urls.filter((url) => typeof url === "string" && /^https:\/\//i.test(url))
@@ -345,6 +428,7 @@ const engine = createPiEngine({
     } else if (event.type === "agent_settled") finish(active, "done");
   },
 });
+if (loadPlugins().some(plugin => plugin.id === "memory" && (plugin.status || "installed") === "installed")) ensureMemoryPluginConfig();
 engine.start();
 
 /**
@@ -382,6 +466,9 @@ const DATA_CLI_NOTE = [
   "7) 输出里形如 `[3]` 的数字只是**你自己下一条命令要用的句柄**，回复用户时**不要报这些编号、不要提字段名**；用分身的名字称呼它（如「墨白」），对话就用标题指代。用户看不懂内部编号，也不需要看。",
 ].join("\n");
 
+const CREDENTIAL_CLI_NOTE = "技能如果需要 API Key、Token 或 API 地址，请从技能 SKILL.md 确认准确的参数名和技能目录名（即 skill-id），再用 kitsume-credential run <skill-id> <参数名[,参数名...]> -- <命令> [参数...] 执行技能脚本。CLI 仅将所列参数注入子进程环境；参数名区分大小写。不要在父 shell 中提前展开参数，不要向用户索要聊天中的密钥，也不要输出凭证值。若返回 MISSING_CREDENTIAL，请明确告诉用户技能名、参数名，并引导到工作台 → Skills 技能 → API Key/凭证。";
+const SKILL_INSTALL_NOTE = "用户要求安装技能时，必须真的把完整技能包安装到容器中，不能只创建含安装提示词的 SKILL.md。SkillHub 的 @发布者/技能名请用 bash 工具执行 kitsume-skill install @发布者/技能名；公开 HTTPS ZIP 链接用 kitsume-skill install 链接。命令成功后检查安装目录内的 SKILL.md，按需阅读其中的依赖或授权步骤。只有真实安装成功才向用户报告成功；安装失败要说明具体错误。";
+
 function startJob(message, sessionId, images, scheduledTaskId) {
   const job = { id: crypto.randomUUID(), createdAt: Date.now(), status: "queued", reply: "", generatedImageMarkdown: "", usage: null, events: [], interactions: new Map(), error: "", errorCode: "", done: false, thinkingSeen: false, thinkingFinished: false, userTurnStarted: false, scheduledTaskId, sessionId: scheduledTaskId ? "" : sessionId };
   job.completion = new Promise((resolve) => { job.resolveCompletion = resolve; });
@@ -411,13 +498,27 @@ function startJob(message, sessionId, images, scheduledTaskId) {
       // 追加数据 CLI 说明（放在用户配置之后）。没有 GW_TOKEN 就没有身份，此时不追加 ——
       // 否则模型会去调一个必然失败的命令，反而浪费一轮。
       const note = process.env.GW_TOKEN ? DATA_CLI_NOTE : "";
-      const composed = [preamble, note].filter(Boolean).join("\n\n");
+      const installedSkills = visibleSkills().filter(skill => skill.enabled !== false);
+      const credentialNote = installedSkills.length
+        ? CREDENTIAL_CLI_NOTE + "\n当前已安装技能（显示名 | 凭证作用域 skill-id | 内部名）：\n"
+          + installedSkills.slice(0, 50).map(skill => `${skill.name} | ${skill.id} | ${skill.manifestName || skill.name}`).join("\n")
+          + "\n调用 kitsume-credential 时必须使用此处完整 skill-id，不能用显示名、包名或内部名猜测。"
+        : "";
+      const composed = [preamble, note, credentialNote, SKILL_INSTALL_NOTE].filter(Boolean).join("\n\n");
       const outgoing = composed ? `${composed}\n\n${message}` : message;
       console.log(`[pi-gw] turn model=${wanted || "(default)"}${images && images.length ? " (vision)" : ""} preamble=${preamble ? preamble.length + "字" : "无"}+dataCli=${note ? note.length + "字" : "无"}`);
       if (job.sessionId) appendSessionMessage(job.sessionId, "user", message);
       await engine.prompt(outgoing, images);
       await job.completion;
-    } catch (error) { finish(job, "failed", classifyError(error), error.message); }
+    } catch (error) {
+      finish(job, "failed", classifyError(error), error.message);
+      // Pi can remain blocked on a dismissed extension dialog. A timed-out
+      // session command leaves later jobs blocked too, so replace that process.
+      if (/PI command timed out/.test(String(error.message))) {
+        await engine.restart();
+        lastError = "";
+      }
+    }
   });
   return job;
 }
@@ -509,7 +610,7 @@ const handleRequest = async (request, response) => {
   if (request.method === "GET" && url.pathname === "/health") {
     response.writeHead(engine.ready() ? 200 : 503, { "Content-Type": "application/json" });
     response.end(JSON.stringify({
-      ok: engine.ready(), runtime: "pi", runtimeVersion: "0.85.1", version: "gateway/pi-p2", jobs: jobs.size,
+      ok: engine.ready(), runtime: "pi", runtimeVersion: "0.85.1", version: "gateway/pi-p3", jobs: jobs.size,
       engine_ready: engine.ready(), ...(lastError ? { error: lastError } : {}),
     }));
     return;
@@ -549,7 +650,12 @@ const handleRequest = async (request, response) => {
       const stat = fs.statfsSync(directory);
       const totalBytes = Number(stat.blocks) * Number(stat.bsize);
       const freeBytes = Number(stat.bavail) * Number(stat.bsize);
-      const usedBytes = workspaceUsage(directory);
+      // .model-billing 是故意设为 root:root/0700 的计费队列，网关以 node
+      // 身份运行，不应为了统计缓存而读取或放宽这个目录的权限。缓存 PVC 用
+      // statfs 的已分配块统计，既包含这个目录，也不会因 EACCES 返回 500。
+      const usedBytes = requestedPath === "/home/node/.pi"
+        ? Math.max(0, totalBytes - Number(stat.bfree) * Number(stat.bsize))
+        : workspaceUsage(directory);
       return send(response, 200, { path: requestedPath, usedBytes, totalBytes, freeBytes, usedPct: totalBytes ? Math.round(usedBytes * 10000 / totalBytes) / 100 : 0 });
     } catch (error) { return send(response, 500, { error: error.message }); }
   }
@@ -675,6 +781,7 @@ const handleRequest = async (request, response) => {
       void (async () => {
         try {
           await execFileAsync("pi", ["install", approved.spec], { cwd: process.env.PI_CODING_AGENT_DIR || "/home/node/.pi/agent", env: pluginInstallEnv, timeout: 120000, maxBuffer: 1024 * 1024 });
+          if (approved.id === "memory") ensureMemoryPluginConfig();
           // 只有新 PI 进程已启动后才对端上标记 installed，避免用户刚看到成功就去对话，
           // 但扩展尚未被新内核加载的竞态。
           await engine.restart(); lastError = "";
@@ -704,44 +811,13 @@ const handleRequest = async (request, response) => {
     try { return send(response, 200, { models: await engine.models(), current: loadSettings(), reasoning: ["off", "minimal", "low", "medium", "high", "xhigh", "max"] }); }
     catch (error) { return send(response, 503, { error: error.message }); }
   }
-  if (request.method === "GET" && url.pathname === "/skills") return send(response, 200, { skills: loadSkills() });
-  if (request.method === "POST" && url.pathname === "/skills") {
-    try {
-      const input = await readBody(request);
-      if (typeof input.name !== "string" || !input.name.trim()) return send(response, 400, { error: "技能名称必填" });
-      const installUrl = typeof input.installUrl === "string" ? input.installUrl.trim() : "";
-      if (!installUrl && (typeof input.prompt !== "string" || !input.prompt.trim())) return send(response, 400, { error: "执行指令必填" });
-      const skill = { id: crypto.randomUUID(), name: input.name.trim(), icon: typeof input.icon === "string" ? input.icon.slice(0, 32) : "", description: typeof input.description === "string" ? input.description.trim() : "", prompt: installUrl ? "" : input.prompt.trim(), enabled: input.enabled !== false, createdAt: Date.now(), updatedAt: Date.now() };
-      if (installUrl) await installSkillPackage(skill, installUrl); else writeSkill(skill);
-      const skills = loadSkills(); skills.unshift(skill); saveSkills(skills);
-      return send(response, 200, skill);
-    } catch (error) { return send(response, 400, { error: error.message }); }
+  if (request.method === "GET" && url.pathname === "/skills") {
+    const skills = visibleSkills().map(({ prompt, ...skill }) => skill);
+    return send(response, 200, { skills });
   }
   const skillMatch = url.pathname.match(/^\/skills\/([\w-]+)$/);
-  if (skillMatch && request.method === "PUT") {
-    try {
-      const input = await readBody(request); const skills = loadSkills(); const skill = skills.find((item) => item.id === skillMatch[1]);
-      if (!skill) return send(response, 404, { error: "skill not found" });
-      if (typeof input.name === "string") { if (!input.name.trim()) return send(response, 400, { error: "name must not be empty" }); skill.name = input.name.trim(); }
-      const installUrl = typeof input.installUrl === "string" ? input.installUrl.trim() : "";
-      if (installUrl) await installSkillPackage(skill, installUrl);
-      else if (typeof input.prompt === "string") {
-        if (!input.prompt.trim()) return send(response, 400, { error: "prompt must not be empty" });
-        delete skill.installUrl; skill.prompt = input.prompt.trim(); writeSkill(skill);
-      }
-      if (typeof input.icon === "string") skill.icon = input.icon.slice(0, 32);
-      if (typeof input.description === "string") skill.description = input.description.trim();
-      if (typeof input.enabled === "boolean") skill.enabled = input.enabled;
-      skill.updatedAt = Date.now(); saveSkills(skills); return send(response, 200, skill);
-    } catch (error) { return send(response, 400, { error: error.message }); }
-  }
-  if (skillMatch && request.method === "DELETE") {
-    const skills = loadSkills(); const index = skills.findIndex((skill) => skill.id === skillMatch[1]);
-    if (index < 0) return send(response, 404, { error: "skill not found" });
-    const [skill] = skills.splice(index, 1); saveSkills(skills);
-    fs.rmSync(skillDirectory(skill.id), { recursive: true, force: true });
-    return send(response, 200, { ok: true });
-  }
+  if ((url.pathname === "/skills" || skillMatch) && ["POST", "PUT", "DELETE"].includes(request.method))
+    return send(response, 405, { error: "请在工作台对话中安装或管理技能" });
   if (request.method === "GET" && url.pathname === "/tasks") return send(response, 200, { tasks: loadTasks() });
   if (request.method === "POST" && url.pathname === "/tasks") {
     try {
@@ -830,6 +906,10 @@ const handleRequest = async (request, response) => {
       if (job.status === "queued") { finish(job, "cancelled", "CANCELLED"); return send(response, 200, { ok: true }); }
       if (job === active) {
         try {
+          // A pending extension dialog must be answered before Pi can process
+          // clear_queue/abort; otherwise every later new_session times out.
+          for (const id of job.interactions.keys()) engine.respondInteraction(id, { cancelled: true });
+          job.interactions.clear();
           await engine.clearQueue();
           // 先记账再 finish：finish 会清空 active，用户下一条随即可能开始，
           // 这一轮被中止后的收尾事件必须能被识别出来（见 onEvent ② 段）。
